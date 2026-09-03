@@ -1,0 +1,71 @@
+{
+  "version": 1,
+  "nodes": [
+    {
+      "name": "cupfox",
+      "address": "100.115.119.40",
+      "ssh_user": "root",
+      "role": "cpu",
+      "runtime": "docker",
+      "max_cpus": 2,
+      "max_memory_gib": 3,
+      "ephemeral": false,
+      "webgpu_port": 8790,
+      "arch": "x86_64"
+    },
+    {
+      "name": "nixos-laptop",
+      "address": "100.102.173.61",
+      "ssh_user": "root",
+      "role": "cpu",
+      "runtime": "nix-podman",
+      "max_cpus": 8,
+      "max_memory_gib": 10,
+      "ephemeral": false,
+      "webgpu_port": 8790,
+      "arch": "x86_64"
+    },
+    {
+      "name": "qfox-1",
+      "address": "100.88.57.96",
+      "ssh_user": "allaun",
+      "role": "gpu",
+      "runtime": "podman-nvidia-cdi",
+      "max_cpus": 8,
+      "max_memory_gib": 20,
+      "ephemeral": false,
+      "gpu": "nvidia-geforce-rtx-4070-super-12gb",
+      "arch": "x86_64"
+    },
+    {
+      "name": "neon-rs1000",
+      "address": "100.79.14.103",
+      "ssh_user": "${MATHPUNCH_NEON_USER}",
+      "role": "overflow",
+      "runtime": "auto",
+      "max_cpus": 8,
+      "max_memory_gib": 48,
+      "ephemeral": true,
+      "retirement_note": "Neon provider VM (provider-nixos). SSH user must be set via MATHPUNCH_NEON_USER. Treat as disposable.",
+      "webgpu_port": 8790,
+      "arch": "x86_64"
+    },
+    {
+      "name": "nasfox",
+      "address": "100.119.121.83",
+      "ssh_user": "root",
+      "role": "gpu",
+      "runtime": "bare",
+      "max_cpus": 8,
+      "max_memory_gib": 32,
+      "ephemeral": false,
+      "gpu": "amd-radeon-rx-580-8gb",
+      "webgpu_port": 8790,
+      "arch": "x86_64",
+      "note": "NAS box; RX 580 (Polaris) is CUDA-incompatible \u2014 harnessed via WebGPU (RADV)."
+    }
+  ],
+  "_notes": [
+    "2026-08-09: neon-64gb was mislabeled/stale (address 100.92.88.64 not in Tailscale mesh); renamed neon-rs1000 @ 100.79.14.103. The ARM node is no longer available; all nodes are x86_64. nixos-laptop has an AMD Radeon iGPU (RADV) \u2014 native WebGPU without llvmpipe."
+  ]
+}

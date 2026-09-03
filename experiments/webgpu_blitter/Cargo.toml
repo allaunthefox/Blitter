@@ -1,0 +1,9 @@
+[package]
+name = "webgpu-blitter"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+wgpu = "30"
+pollster = "0.4"
+bytemuck = { version = "1", features = ["derive"] }
