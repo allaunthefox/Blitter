@@ -28,15 +28,43 @@ contracts. It runs on pushes, pull requests, and manual dispatch.
   and the `--require-published` negative checks prove bootstrap digests cannot
   pass as production (both for catalogs and for worker publication).
 - The target-side LSP lease service job runs atomic-ownership, fencing,
-  restart-invalidation, and concurrent-acquire race tests, plus a loopback HTTP
-  smoke check of `/health` and `/lsp/lease/status` (which must never expose
-  the bearer token).
+  restart-invalidation, and concurrent-acquire race tests, plus a loopback
+  HTTP smoke check of `/health` and `/lsp/lease/status` (which must never
+  expose the bearer token).
+- The lease service refuses to start without `--auth-token` (or
+  `BLITTER_LSP_LEASE_TOKEN`); a missing token is a test failure. The token
+  is required on all authority-bearing endpoints and compared with
+  `hmac.compare_digest`.
+- The lease service worker cgroup termination path is exercised: setting
+  `--worker-cgroup` to a test cgroup and triggering a revoke or expiry
+  causes the cgroup to be signalled (a cgroup-v2 `cgroup.kill` write is
+  attempted with a per-process fallback). The lease service on graceful
+  shutdown (`atexit`) also runs the termination path.
+- The dispatch path requires `--catalog` and `--catalog-policy`; a missing
+  catalog or policy is a test failure. The signed catalog is verified
+  against `approved_keys` and the policy's `approved_images` allowlist. A
+  bare digest-pinned image without a catalog is **never** accepted.
+- The dispatch path enforces `DOCKER_CONTENT_TRUST=1` for the docker
+  runtime; a missing env var is a test failure. The local image is
+  not cryptographically authorized without it.
+- The workspace hardening layer is exercised: `pin_workspace` captures
+  the resolved `(device, inode)` and re-verifies before mount. A symlink
+  swap between validation and mount is a test failure (`WorkspaceError`).
+- The transport layer wires the lease hooks: `begin` after SSH start,
+  `commit` before release. A stale worker that has been revoked triggers
+  `commit` to raise, and the transport propagates `TransportError` to the
+  caller.
 - The `lean` job builds the root `MathPunchFiniteState` lake project
   (`lake build` under `leanprover/lean4:v4.31.0`).
 - The `isa-profile` job runs the frozen mechanical profile gate. The gate
   passing is necessary but not sufficient: the profile remains
   `PROVISIONAL_PENDING_REVIEW` until the semantic review in
   `BLITTER_ISA_REVIEW_V1.md` is completed and signed.
+- The six language Containerfiles have pinned apt package versions,
+  checksummed binary installers (elan, opam), and locked opam switch /
+  pip / R / Julia / Rust toolchain versions. Build-time dependency drift
+  is a test failure (the bash heredoc content is checked in
+  `test_worker_images.py`).
 - `scripts/cluster/nodes.json` is checked as JSON syntax only; it is not probed.
 
 The LSP tests intentionally use synthetic digest-pinned descriptors and do not

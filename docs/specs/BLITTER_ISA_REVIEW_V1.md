@@ -43,7 +43,7 @@ gate deployments, and MUST NOT promote claims.
 | R3 | `PREFIX_COVER_VALIDATE` / `GLOBAL_MAX_FROM_COVER` aggregation semantics match the merge/partition implementation's disjoint gap-free partition claim | — | OPEN |
 | R4 | Closed-universe claim holds on all deployment targets (no endianness/word-size/host-layout dependence in `verify_u192_carry.cpp`, WGSL shaders, or the Rust codec) | — | OPEN |
 | R5 | B4 scope exclusions are complete: no other shader, kernel, or helper in the tree can be mistaken for an LKB/Burau computation | — | OPEN |
-| R6 | Protocol-layer separation is operationally real: lease/heartbeat/clock paths cannot alter arithmetic bytes (review `lease_gate.py` commit fence and daemon wiring) | — | OPEN |
+| R6 | Protocol-layer separation is operationally real: lease/heartbeat/clock paths cannot alter arithmetic bytes. The webgpu `lease_gate.py` commit fence AND the new LSP `lsp_lease_server.py` fenced session lifecycle (`session_begin` after SSH start, `session_commit` before release) both re-validate the lease identity at the boundary where a stale worker would otherwise commit diagnostics. Worker termination on revoke/expire/restart is via `--worker-cgroup` (Linux cgroup-v2 `cgroup.kill`). | — | OPEN |
 | R7 | `MathPunchFiniteState/BlitterU192Transport.lean` witness (`u192AddMod_lt`) is typechecked by the pinned toolchain (`lake build`, CI `lean` lane) and its statement matches the profile relation | — | OPEN |
 
 ## Record
