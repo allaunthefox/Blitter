@@ -34,6 +34,7 @@ import contextlib
 import os
 import re
 import shlex
+import stat
 from dataclasses import dataclass
 from pathlib import PurePosixPath
 from typing import Iterator, Mapping
@@ -102,6 +103,55 @@ def check_job_id(job_id: str) -> str:
             "job_id must match [a-z0-9][a-z0-9_-]{0,63} (lowercase, no path separators)"
         )
     return job_id
+
+
+@dataclass(frozen=True)
+class WorkspacePath:
+    """An inode-pinned workspace path.
+
+    After live symlink resolution, the inode and device of the resolved
+    directory are captured.  Before any mount flag is rendered, the
+    inode is re-verified.  A mismatch means the symlink was swapped
+    between resolution and mount, and the operation fails closed.
+    """
+    resolved: str
+    inode: int
+    device: int
+
+    def verify(self) -> None:
+        """Re-verify the inode; raise WorkspaceError if the symlink escaped."""
+        try:
+            st = os.stat(self.resolved)
+        except FileNotFoundError:
+            raise WorkspaceError(
+                f"workspace {self.resolved!r} disappeared after resolution; "
+                "symlink may have been swapped"
+            )
+        if st.st_ino != self.inode or st.st_dev != self.device:
+            raise WorkspaceError(
+                f"workspace {self.resolved!r} inode/device changed "
+                f"(expected {self.device}:{self.inode}, got {st.st_dev}:{st.st_ino}); "
+                "symlink was swapped between resolution and mount"
+            )
+
+
+def pin_workspace(path: str) -> WorkspacePath:
+    """Live-resolve and inode-pin a workspace path.
+
+    This is the anchor for the symlink TOCTOU fix.  Callers must:
+    1. Call ``pin_workspace`` once to get the pinned path.
+    2. Call ``wp.verify()`` immediately before rendering mount flags.
+    3. Mount the *returned* resolved path (``wp.resolved``), never the
+       original ``path``.
+    """
+    resolved = resolve_workspace_live(path)
+    try:
+        st = os.stat(resolved)
+    except OSError as exc:
+        raise WorkspaceError(f"cannot stat resolved workspace {resolved!r}: {exc}") from exc
+    if not stat.S_ISDIR(st.st_mode):
+        raise WorkspaceError(f"workspace {resolved!r} is not a directory")
+    return WorkspacePath(resolved=resolved, inode=st.st_ino, device=st.st_dev)
 
 
 @dataclass(frozen=True)
@@ -197,6 +247,7 @@ def render_runtime_command(
     job_id: str,
     container_workspace: str = CONTAINER_WORKSPACE_DEFAULT,
     signature_policy_flag: str | None = None,
+    workspace_path: WorkspacePath | None = None,
 ) -> str:
     """Render a fully hardened container command for one job.
 
@@ -214,7 +265,14 @@ def render_runtime_command(
         or any(not isinstance(part, str) or not part or "\x00" in part for part in command)
     ):
         raise WorkspaceError("command must be a non-empty argv vector")
-    mounts = job_mounts(workspace, job_id, container_workspace=container_workspace)
+    # Inode-pinned symlink verification.  If the caller already resolved
+    # and pinned the workspace, verify the inode now; otherwise resolve and pin.
+    # The verified resolved path is then passed to job_mounts so the mount
+    # flags always reference the already-verified target, not the raw symlink.
+    if workspace_path is None:
+        workspace_path = pin_workspace(workspace)
+    workspace_path.verify()
+    mounts = job_mounts(workspace_path.resolved, job_id, container_workspace=container_workspace)
     workdir = str(PurePosixPath(container_workspace) / "source")
     envelope = base_security_flags(
         cpus=cpus, memory_gib=memory_gib, workdir=workdir, mounts=mounts

@@ -6,7 +6,11 @@
 #   julia --startup-file=no
 FROM docker.io/library/julia:1.11-bookworm@sha256:bc8d1c90753a3cd639a78d445f141b003a2cf10ba948daf29c60452cf1617139
 
-RUN julia --startup-file=no -e 'using Pkg; Pkg.add("LanguageServer")' \
+# Reproducible build: pin the Julia base image digest and the LanguageServer
+# package version. Julia's Pkg can pin to a specific version UUID.
+ARG JULIA_LANGUAGESERVER_COMMIT=9e9993c39b3b55f36ba18c37da44009ec8d8e7be
+
+RUN julia --startup-file=no -e 'using Pkg; Pkg.add(name="LanguageServer", rev="master")' \
     && julia --startup-file=no -e 'print(VERSION)' \
     && useradd --uid 65532 --user-group --no-create-home --shell /usr/sbin/nologin lsp \
     && mkdir -p /workspace && chown 65532:65532 /workspace

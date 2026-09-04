@@ -15,10 +15,25 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PATH=/opt/elan/bin:/usr/local/bin:/usr/bin:/bin \
     LEAN_TOOLCHAIN=leanprover/lean4:v4.15.0
 
+# Reproducible build: pin apt package versions and checksum the elan installer.
+# elan-init.sh is checksummed against the version pinned below to prevent
+# a tampered upstream script from being installed. The version matches the
+# Lean toolchain defined in ENV.
+ARG ELAN_VERSION=1.0.27
+ARG ELAN_SHA256=8c0834c0bbab898f9d7ef7ed17d655d59f8b08b5c9315d8d40e7d9d74d35d2d9
+ARG CURL_VERSION=7.88.1-10+deb12u14
+ARG GIT_VERSION=1:2.39.5-0+deb12u2
+ARG CA_CERTIFICATES_VERSION=20230311+deb12u1
+
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl git \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates="${CA_CERTIFICATES_VERSION}" \
+        curl="${CURL_VERSION}" \
+        git="${GIT_VERSION}" \
     && rm -rf /var/lib/apt/lists/* \
-    && curl -fsSL https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh -o /tmp/elan-init.sh \
+    && curl -fsSL -o /tmp/elan-init.sh \
+        "https://github.com/leanprover/elan/releases/download/v${ELAN_VERSION}/elan-init.sh" \
+    && echo "${ELAN_SHA256}  /tmp/elan-init.sh" | sha256sum -c - \
     && sh /tmp/elan-init.sh -y --default-toolchain "$LEAN_TOOLCHAIN" --no-modify-path \
     && rm -f /tmp/elan-init.sh \
     && ln -s /opt/elan/bin/lake /usr/local/bin/lake \

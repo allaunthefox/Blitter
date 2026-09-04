@@ -11,7 +11,15 @@ ENV RUSTUP_HOME=/opt/rustup \
     CARGO_HOME=/opt/cargo \
     PATH=/opt/cargo/bin:/usr/local/bin:/usr/bin:/bin
 
-RUN rustup component add rust-analyzer \
+# Reproducible build: rust base image is digest-pinned. rust-analyzer
+# is installed via rustup with an explicit pinned toolchain. Using a fixed
+# Rust toolchain version (not 'stable') prevents a mutable toolchain from
+# changing the binary between builds.
+ARG RUSTUP_TOOLCHAIN=1.83.0
+
+RUN rustup install "${RUSTUP_TOOLCHAIN}" \
+    && rustup default "${RUSTUP_TOOLCHAIN}" \
+    && rustup component add --toolchain "${RUSTUP_TOOLCHAIN}" rust-analyzer \
     && rust-analyzer --version \
     && useradd --uid 65532 --user-group --no-create-home --shell /usr/sbin/nologin lsp \
     && mkdir -p /workspace && chown 65532:65532 /workspace

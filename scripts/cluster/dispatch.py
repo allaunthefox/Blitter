@@ -89,6 +89,10 @@ def runtime_command(node: Node, image: str, command: list[str], cpus: int, memor
     quoted_command = " ".join(shlex.quote(part) for part in command)
     image_q = shlex.quote(image)
     if node.runtime == "docker":
+        # Docker Content Trust is mandatory.  Without it, the local image
+        # is not cryptographically authorized and must not be launched.
+        from lsp_workers import docker_content_trust_check
+        docker_content_trust_check()
         return f"docker run --rm --cpus={cpus} --memory={memory_gib}g {image_q} {quoted_command}"
     if node.runtime == "podman-nvidia-cdi":
         return (
@@ -135,6 +139,39 @@ def cmd_run(node: Node, args: argparse.Namespace) -> int:
         raise ValueError(f"CPU request exceeds {node.name} cap ({node.max_cpus})")
     if memory < 1 or memory > node.max_memory_gib:
         raise ValueError(f"memory request exceeds {node.name} cap ({node.max_memory_gib} GiB)")
+    # Catalog + policy are MANDATORY.  cmd_run previously accepted any
+    # digest-pinned image, which is the security regression: only an image
+    # whose digest is in the deployment-owned approved list AND whose
+    # catalog signature/provenance passes verify_image_trust may be launched.
+    if not getattr(args, "catalog", None):
+        raise ValueError(
+            "run dispatch requires --catalog (the deployment-owned signed "
+            "image catalog). Bare digest-pinned images are no longer accepted."
+        )
+    if not getattr(args, "catalog_policy", None):
+        raise ValueError("--catalog requires --catalog-policy")
+    catalog = json.loads(args.catalog.read_text(encoding="utf-8"))
+    policy = json.loads(args.catalog_policy.read_text(encoding="utf-8"))
+    if not isinstance(policy, dict):
+        raise ValueError("catalog policy must be a JSON object")
+    if "approved_keys" not in policy:
+        raise ValueError(
+            "catalog policy is missing 'approved_keys'; only signed catalogs "
+            "are accepted by the dispatcher."
+        )
+    if not policy.get("approved_images"):
+        raise ValueError("catalog policy is missing 'approved_images' allowlist")
+    verify_image_trust(catalog, policy)
+    # Look up the image in the catalog by digest.  The catalog is the only
+    # source of truth for which images are allowed.
+    image_digest = args.image.rsplit("@", 1)[-1] if "@" in args.image else args.image
+    if not any(
+        entry.get("image", "").rsplit("@", 1)[-1] == image_digest
+        for entry in catalog.get("images", {}).values()
+    ):
+        raise ValueError(
+            f"image {args.image!r} is not in the approved catalog; refusing to run"
+        )
     remote = runtime_command(node, args.image, args.command, cpus, memory)
     result = ssh(node, remote, timeout=args.timeout)
     sys.stdout.write(result.stdout)
@@ -152,30 +189,50 @@ def cmd_lsp(node: Node, args: argparse.Namespace) -> int:
         raise ValueError(f"CPU request exceeds {node.name} cap ({node.max_cpus})")
     if spec.memory_gib > node.max_memory_gib:
         raise ValueError(f"memory request exceeds {node.name} cap ({node.max_memory_gib} GiB)")
+    # Catalog + policy are MANDATORY.  Without them, the dispatcher would
+    # accept any syntactically digest-pinned image, which is the security
+    # regression: only an image whose digest is in the deployment-owned
+    # approved list AND whose catalog signature/provenance passes verify_image_trust
+    # may be launched.
     catalog_path = getattr(args, "catalog", None)
-    if catalog_path is not None:
-        policy_path = getattr(args, "catalog_policy", None)
-        if policy_path is None:
-            raise ValueError("--catalog requires --catalog-policy")
-        catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
-        policy = json.loads(policy_path.read_text(encoding="utf-8"))
-        if not isinstance(policy, dict):
-            raise ValueError("catalog policy must be a JSON object")
-        if "approved_keys" in policy:
-            # Deployment-owned trust roots: verify signature, provenance
-            # allowlist, and SBOM bindings, not just catalog shape.
-            verify_image_trust(catalog, policy)
-        else:
-            approved_images = policy.get("approved_images")
-            resource_ceilings = policy.get("resource_ceilings")
-            validate_catalog(
-                catalog,
-                approved_images=approved_images,
-                resource_ceilings=resource_ceilings,
-            )
-        entry = catalog["images"][spec.language]
-        if entry["image"] != spec.image or tuple(entry["argv"]) != spec.command:
-            raise ValueError("LSP descriptor does not match catalog language entry")
+    if catalog_path is None:
+        raise ValueError(
+            "LSP dispatch requires --catalog (the deployment-owned signed "
+            "image catalog). Bare digest-pinned images are no longer accepted; "
+            "the catalog and policy are the trust roots."
+        )
+    policy_path = getattr(args, "catalog_policy", None)
+    if policy_path is None:
+        raise ValueError(
+            "--catalog requires --catalog-policy (deployment-owned approved "
+            "keys/images/sources/provenance allowlist). Without a policy the "
+            "trust verification is refused."
+        )
+    catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
+    policy = json.loads(policy_path.read_text(encoding="utf-8"))
+    if not isinstance(policy, dict):
+        raise ValueError("catalog policy must be a JSON object")
+    # Always run the cryptographic verification path when approved_keys is
+    # present.  The legacy "approved_images only" path that skips signature
+    # verification is no longer accepted at this layer; deployments must
+    # publish a signed catalog.
+    if "approved_keys" not in policy:
+        raise ValueError(
+            "catalog policy is missing 'approved_keys'; only signed catalogs "
+            "are accepted by the dispatcher. Use sign_lsp_catalog.py to sign "
+            "the catalog and place the verification key into the policy."
+        )
+    if not policy.get("approved_images"):
+        raise ValueError(
+            "catalog policy is missing 'approved_images'; a non-empty allowlist "
+            "is required to bind the approved set of image digests."
+        )
+    # Deployment-owned trust roots: verify signature, provenance
+    # allowlist, and SBOM bindings, not just catalog shape.
+    verify_image_trust(catalog, policy)
+    entry = catalog["images"][spec.language]
+    if entry["image"] != spec.image or tuple(entry["argv"]) != spec.command:
+        raise ValueError("LSP descriptor does not match catalog language entry")
     remote = lsp_runtime_command(node.runtime, spec)
     if getattr(args, "interactive", False):
         presence_path = getattr(args, "presence", None)
@@ -216,6 +273,7 @@ def cmd_lsp(node: Node, args: argparse.Namespace) -> int:
             image_digest=image_digest,
             holder=args.lease_holder,
             ttl_ms=args.lease_ttl_ms,
+            auth_token=os.environ.get("BLITTER_LSP_LEASE_TOKEN", ""),
         )
         return run_lsp_transport(
             node.destination,
@@ -226,7 +284,13 @@ def cmd_lsp(node: Node, args: argparse.Namespace) -> int:
                 total_timeout=args.total_timeout,
                 lease_renew_interval=args.lease_ttl_ms / 3000,
             ),
-            lease_hooks=LeaseHooks(lease_client.acquire, lease_client.release, lease_client.renew),
+            lease_hooks=LeaseHooks(
+                acquire=lease_client.acquire,
+                release=lease_client.release,
+                renew=lease_client.renew,
+                begin=lease_client.session_begin,
+                commit=lease_client.session_commit,
+            ),
         )
     result = ssh(node, remote, timeout=args.timeout)
     sys.stdout.write(result.stdout)
@@ -247,14 +311,18 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--timeout", type=int, default=1800)
     run.add_argument("--gpu", action="store_true")
     run.add_argument("--allow-ephemeral", action="store_true")
+    run.add_argument("--catalog", type=Path, required=True,
+                     help="REQUIRED deployment-owned signed image catalog")
+    run.add_argument("--catalog-policy", type=Path, required=True,
+                     help="REQUIRED deployment-owned policy (approved keys/images/sources)")
     run.add_argument("command", nargs=argparse.REMAINDER)
     lsp = sub.add_parser("lsp", help="run a validated containerized language server")
     lsp.add_argument("node")
     lsp.add_argument("--descriptor", type=Path, required=True)
-    lsp.add_argument("--catalog", type=Path,
-                     help="optional six-language catalog used to check descriptor drift")
-    lsp.add_argument("--catalog-policy", type=Path,
-                     help="deployment-owned approved images/resource ceilings for --catalog")
+    lsp.add_argument("--catalog", type=Path, required=True,
+                     help="REQUIRED six-language catalog used to check descriptor drift")
+    lsp.add_argument("--catalog-policy", type=Path, required=True,
+                     help="REQUIRED deployment-owned approved keys/images/sources/provenance for --catalog")
     lsp.add_argument("--timeout", type=int, default=1800)
     lsp.add_argument("--interactive", action="store_true",
                      help="stream LSP stdin/stdout over SSH instead of buffering")
@@ -266,6 +334,8 @@ def build_parser() -> argparse.ArgumentParser:
     lsp.add_argument("--lease-url", type=str,
                      help="target LSP lease endpoint; required for --interactive")
     lsp.add_argument("--lease-ttl-ms", type=int, default=30000)
+    lsp.add_argument("--lease-auth-token", type=str, default="",
+                     help="bearer token for the lease endpoint (or BLITTER_LSP_LEASE_TOKEN env)")
     lsp.add_argument("--lease-holder", default="cluster-dispatch")
     lsp.add_argument("--worker-generation", type=int, default=0,
                      help="worker generation identity announced by announce_presence.py")

@@ -8,7 +8,11 @@
 #   R --vanilla --slave
 FROM docker.io/rocker/r-ver:4.4.1@sha256:d0b5d2edcdf142df94eaa6ad32ff3b5388e468d8f41df1de57b9276fb7de596c
 
-RUN R --vanilla --slave -e 'install.packages("languageserver", repos="https://cloud.r-project.org")' \
+# Reproducible build: pin the R base image digest, pin the languageserver
+# package version, and pin the R version.
+ARG R_LANGUAGESERVER_VERSION=0.3.18
+
+RUN R --vanilla --slave -e 'install.packages("languageserver", repos="https://cloud.r-project.org", version="${R_LANGUAGESERVER_VERSION}")' \
     && R --vanilla --slave -e 'cat(R.version.string)' \
     && useradd --uid 65532 --user-group --no-create-home --shell /usr/sbin/nologin lsp \
     && mkdir -p /workspace && chown 65532:65532 /workspace

@@ -24,7 +24,43 @@ CANONICAL_COMMANDS: dict[str, tuple[str, ...]] = {
     "julia": ("julia", "--startup-file=no"),
     "rust": ("rust-analyzer",),
 }
-APPROVED_WORKSPACE_ROOT = PurePosixPath("/srv/mathpunch/workspaces")
+# Reference the canonical approved root from workspace_execution so test
+# patches and the production layout stay aligned.  We import lazily to avoid
+# a hard dependency cycle at module load time.
+def _get_approved_root() -> PurePosixPath:
+    try:
+        from . import workspace_execution as _ws
+    except ImportError:
+        import workspace_execution as _ws
+    return _ws.APPROVED_WORKSPACE_ROOT
+# Note: this is a *reference* to the live value, but the tests and the
+# dispatcher only need to call _approved_workspace_root() to get the current
+# value.  We do not expose APPROVED_WORKSPACE_ROOT as a property because
+# that would be unconventional in module globals.
+APPROVED_WORKSPACE_ROOT: PurePosixPath = _get_approved_root()
+
+
+def _approved_workspace_root() -> PurePosixPath:
+    """Return the current approved workspace root, looking up live.
+
+    This is the canonical accessor for the approved root inside
+    lsp_workers.  Tests that patch workspace_execution.APPROVED_WORKSPACE_ROOT
+    must also call this function (or call _refresh_approved_root() to
+    re-import) to see the patched value.
+    """
+    return _get_approved_root()
+
+
+def _refresh_approved_root() -> PurePosixPath:
+    """Re-resolve APPROVED_WORKSPACE_ROOT from workspace_execution.
+
+    Call this in test setUp() after patching
+    workspace_execution.APPROVED_WORKSPACE_ROOT so that lsp_workers sees
+    the new value.
+    """
+    global APPROVED_WORKSPACE_ROOT
+    APPROVED_WORKSPACE_ROOT = _get_approved_root()
+    return APPROVED_WORKSPACE_ROOT
 WORKER_UID = 65532
 WORKER_GID = 65532
 WORKER_PIDS = 128
@@ -36,6 +72,12 @@ _IMAGE_DIGEST = re.compile(r"^.+@sha256:[0-9a-f]{64}$")
 # There is no insecure fallback: rendering a nix-podman/podman command without
 # this variable fails closed instead of accepting any image signature.
 PODMAN_SIGNATURE_POLICY_ENV = "BLITTER_PODMAN_SIGNATURE_POLICY"
+# Docker Content Trust is mandatory for all docker runtimes.  The deployment
+# must configure DCT with its own root key (DOCKER_CONTENT_TRUST_ROOT_PASSPHRASE
+# + DOCKER_CONTENT_TRUST_REPOSITORY_PASSPHRASE) and the registry must be
+# configured to enforce signed tags.  There is no insecure fallback.
+DOCKER_CONTENT_TRUST_ENV = "DOCKER_CONTENT_TRUST"
+DOCKER_CONTENT_TRUST_VAL = "1"
 
 
 def podman_signature_policy_flag() -> str:
@@ -50,6 +92,24 @@ def podman_signature_policy_flag() -> str:
     if not policy.startswith("/"):
         raise ValueError("the Podman signature policy must be an absolute path")
     return f"--signature-policy={shlex.quote(policy)}"
+
+
+def docker_content_trust_check() -> None:
+    """Fail closed if Docker Content Trust is not enabled.
+
+    With DCT enabled, the local Docker client refuses to pull or run
+    images that do not carry a signature from a configured trust root.
+    The deployment is responsible for installing the trust root
+    (notary key material) on every dispatch host.
+    """
+    if os.environ.get(DOCKER_CONTENT_TRUST_ENV) != DOCKER_CONTENT_TRUST_VAL:
+        raise ValueError(
+            f"refusing to render a Docker command without image trust: set "
+            f"{DOCKER_CONTENT_TRUST_ENV}={DOCKER_CONTENT_TRUST_VAL} and ensure "
+            "the deployment trust root is installed in the local Docker trust "
+            "store. A bare --pull=never does not prove the local image is "
+            "authorized."
+        )
 
 
 @dataclass(frozen=True)
@@ -94,8 +154,9 @@ def worker_from_mapping(payload: Mapping[str, Any]) -> LSPWorkerSpec:
     if not isinstance(workspace, str) or not workspace.startswith("/"):
         raise ValueError("workspace must be an absolute host path")
     workspace_path = PurePosixPath(workspace)
-    if ".." in workspace_path.parts or not workspace_path.is_relative_to(APPROVED_WORKSPACE_ROOT):
-        raise ValueError(f"workspace must be beneath {APPROVED_WORKSPACE_ROOT}")
+    root = _approved_workspace_root()
+    if ".." in workspace_path.parts or not workspace_path.is_relative_to(root):
+        raise ValueError(f"workspace must be beneath {root}")
     if not isinstance(container_workspace, str) or not container_workspace.startswith("/"):
         raise ValueError("container_workspace must be an absolute path")
     if ".." in PurePosixPath(container_workspace).parts:
@@ -139,6 +200,21 @@ def runtime_command(runtime: str, spec: LSPWorkerSpec, job_id: str | None = None
     policy_flag: str | None = None
     if runtime == "nix-podman":
         policy_flag = podman_signature_policy_flag()
+    elif runtime == "docker":
+        # All docker runtimes must have DCT enabled.  There is no insecure
+        # fallback.
+        docker_content_trust_check()
+    elif runtime == "podman-nvidia-cdi":
+        # The nvidia-cdi runtime uses raw podman, which is also gated by
+        # the deployment-owned signature policy (no insecure fallback).
+        policy_flag = podman_signature_policy_flag()
+    # Pin the workspace at the symlink-rendered layer.  This captures the
+    # resolved inode and re-verifies it before mount, closing the
+    # validation-to-mount symlink swap race.
+    try:
+        workspace_path = workspace.pin_workspace(spec.workspace)
+    except workspace.WorkspaceError as exc:
+        raise ValueError(str(exc)) from exc
     try:
         return workspace.render_runtime_command(
             runtime=runtime,
@@ -150,6 +226,7 @@ def runtime_command(runtime: str, spec: LSPWorkerSpec, job_id: str | None = None
             job_id=job_id,
             container_workspace=spec.container_workspace,
             signature_policy_flag=policy_flag,
+            workspace_path=workspace_path,
         )
     except workspace.WorkspaceError as exc:
         raise ValueError(str(exc)) from exc

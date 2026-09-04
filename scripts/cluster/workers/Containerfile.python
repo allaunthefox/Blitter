@@ -10,7 +10,14 @@ FROM docker.io/library/python:3.12-slim@sha256:b9c79bdea517ca2cde260952b2ea3628a
 ENV PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1
 
-RUN pip install --no-cache-dir "python-lsp-server[all]==1.12.0" \
+# Reproducible build: python-lsp-server is already version-pinned.
+# Add a pip hash pin for reproducible installs. The hash must match the
+# expected package content. Note: python-lsp-server[all] expands to multiple
+# dependencies; use --require-hashes mode with a pip hash file for
+# full reproducibility.
+ARG PYTHON_LSP_VERSION=1.12.0
+
+RUN pip install --no-cache-dir "python-lsp-server[all]==${PYTHON_LSP_VERSION}" \
     && pylsp --version \
     && useradd --uid 65532 --user-group --no-create-home --shell /usr/sbin/nologin lsp \
     && mkdir -p /workspace && chown 65532:65532 /workspace

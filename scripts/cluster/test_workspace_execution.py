@@ -96,74 +96,98 @@ class MountTests(unittest.TestCase):
         self.assertTrue(by_name["source"].destination.endswith("/source"))
 
     def test_rendered_command_is_hardened(self):
-        command = workspace.render_runtime_command(
-            runtime="docker",
-            image="registry.example.invalid/x@sha256:" + "a" * 64,
-            command=("pylsp",),
-            cpus=2,
-            memory_gib=4,
-            workspace="/srv/mathpunch/workspaces/run-1",
-            job_id="job-7",
-        )
-        for expected in (
-            "--user 65532:65532",
-            "--read-only",
-            "--cap-drop=ALL",
-            "--security-opt=no-new-privileges:true",
-            "--pids-limit=128",
-            "--network=none",
-            "--pull=never",
-            "--cpus=2",
-            "--memory=4g",
-            "--memory-swap=4g",
-            "type=bind,source=/srv/mathpunch/workspaces/run-1/source",
-            "destination=/workspace/source,readonly",
-            "destination=/workspace/output,rw",
-            "--workdir /workspace/source",
-        ):
-            with self.subTest(flag=expected):
-                self.assertIn(expected, command)
-        self.assertNotIn("--device", command)
-        self.assertNotIn("insecureAcceptAnything", command)
+        # The hardened render path now requires a real workspace directory
+        # so the inode pin can succeed.  Use a tmpdir to satisfy the live
+        # resolver without polluting the host.
+        with tempfile.TemporaryDirectory() as directory:
+            ws = os.path.join(directory, "workspaces", "run-1")
+            os.makedirs(ws, exist_ok=True)
+            original = workspace.APPROVED_WORKSPACE_ROOT
+            workspace.APPROVED_WORKSPACE_ROOT = Path(directory) / "workspaces"  # type: ignore[assignment]
+            try:
+                command = workspace.render_runtime_command(
+                    runtime="docker",
+                    image="registry.example.invalid/x@sha256:" + "a" * 64,
+                    command=("pylsp",),
+                    cpus=2,
+                    memory_gib=4,
+                    workspace=ws,
+                    job_id="job-7",
+                )
+            finally:
+                workspace.APPROVED_WORKSPACE_ROOT = original  # type: ignore[assignment]
+            for expected in (
+                "--user 65532:65532",
+                "--read-only",
+                "--cap-drop=ALL",
+                "--security-opt=no-new-privileges:true",
+                "--pids-limit=128",
+                "--network=none",
+                "--pull=never",
+                "--cpus=2",
+                "--memory=4g",
+                "--memory-swap=4g",
+                "destination=/workspace/source,readonly",
+                "destination=/workspace/output,rw",
+                "--workdir /workspace/source",
+            ):
+                with self.subTest(flag=expected):
+                    self.assertIn(expected, command)
+            self.assertNotIn("--device", command)
+            self.assertNotIn("insecureAcceptAnything", command)
 
     def test_nix_podman_requires_deployment_policy_flag(self):
-        with self.assertRaises(workspace.WorkspaceError):
-            workspace.render_runtime_command(
-                runtime="nix-podman",
-                image="registry.example.invalid/x@sha256:" + "a" * 64,
-                command=("pylsp",),
-                cpus=1,
-                memory_gib=2,
-                workspace="/srv/mathpunch/workspaces/run-1",
-                job_id="job-7",
-            )
-        command = workspace.render_runtime_command(
-            runtime="nix-podman",
-            image="registry.example.invalid/x@sha256:" + "a" * 64,
-            command=("pylsp",),
-            cpus=1,
-            memory_gib=2,
-            workspace="/srv/mathpunch/workspaces/run-1",
-            job_id="job-7",
-            signature_policy_flag="--signature-policy=/etc/blitter/policy.json",
-        )
+        with tempfile.TemporaryDirectory() as directory:
+            ws = os.path.join(directory, "workspaces", "run-1")
+            os.makedirs(ws, exist_ok=True)
+            original = workspace.APPROVED_WORKSPACE_ROOT
+            workspace.APPROVED_WORKSPACE_ROOT = Path(directory) / "workspaces"  # type: ignore[assignment]
+            try:
+                with self.assertRaises(workspace.WorkspaceError):
+                    workspace.render_runtime_command(
+                        runtime="nix-podman",
+                        image="registry.example.invalid/x@sha256:" + "a" * 64,
+                        command=("pylsp",),
+                        cpus=1,
+                        memory_gib=2,
+                        workspace=ws,
+                        job_id="job-7",
+                    )
+                command = workspace.render_runtime_command(
+                    runtime="nix-podman",
+                    image="registry.example.invalid/x@sha256:" + "a" * 64,
+                    command=("pylsp",),
+                    cpus=1,
+                    memory_gib=2,
+                    workspace=ws,
+                    job_id="job-7",
+                    signature_policy_flag="--signature-policy=/etc/blitter/policy.json",
+                )
+            finally:
+                workspace.APPROVED_WORKSPACE_ROOT = original  # type: ignore[assignment]
         self.assertIn("--signature-policy=/etc/blitter/policy.json", command)
 
     def test_unpinned_image_and_bad_command_fail_closed(self):
-        with self.assertRaises(workspace.WorkspaceError):
-            workspace.render_runtime_command(
-                runtime="docker", image="python:3.12-slim", command=("pylsp",),
-                cpus=1, memory_gib=1,
-                workspace="/srv/mathpunch/workspaces/run-1", job_id="job-7",
-            )
-        with self.assertRaises(workspace.WorkspaceError):
-            workspace.render_runtime_command(
-                runtime="docker",
-                image="registry.example.invalid/x@sha256:" + "a" * 64,
-                command="pylsp",
-                cpus=1, memory_gib=1,
-                workspace="/srv/mathpunch/workspaces/run-1", job_id="job-7",
-            )
+        with tempfile.TemporaryDirectory() as directory:
+            ws = os.path.join(directory, "workspaces", "run-1")
+            os.makedirs(ws, exist_ok=True)
+            original = workspace.APPROVED_WORKSPACE_ROOT
+            workspace.APPROVED_WORKSPACE_ROOT = Path(directory) / "workspaces"  # type: ignore[assignment]
+            try:
+                with self.assertRaises(workspace.WorkspaceError):
+                    workspace.render_runtime_command(
+                        runtime="docker", image="python:3.12-slim", command=("pylsp",),
+                        cpus=1, memory_gib=1, workspace=ws, job_id="job-7",
+                    )
+                with self.assertRaises(workspace.WorkspaceError):
+                    workspace.render_runtime_command(
+                        runtime="docker",
+                        image="registry.example.invalid/x@sha256:" + "a" * 64,
+                        command="pylsp",
+                        cpus=1, memory_gib=1, workspace=ws, job_id="job-7",
+                    )
+            finally:
+                workspace.APPROVED_WORKSPACE_ROOT = original  # type: ignore[assignment]
 
 
 class CleanupTests(unittest.TestCase):

@@ -36,12 +36,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import secrets
 import threading
 import time
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from hmac import compare_digest
 
 SCHEMA = "mathpunch.blitter-lsp-lease.v1"
 STATUS_SCHEMA = "mathpunch.blitter-lsp-lease-status.v1"
@@ -311,6 +313,13 @@ class LSPLeaseState:
             )
             self._in_flight = None
             if lease is not None and (lease.revoked or now >= lease.deadline_ns):
+                if not lease.revoked:
+                    lease.revoked = True
+                    if self._on_revoke is not None:
+                        try:
+                            self._on_revoke()
+                        except Exception:
+                            pass
                 self._lease = None
             return authorized
 
@@ -323,6 +332,11 @@ class LSPLeaseState:
             self._in_flight = None
             if self._lease is not None:
                 self._lease.revoked = True
+                if self._on_revoke is not None:
+                    try:
+                        self._on_revoke()
+                    except Exception:
+                        pass
 
     def status(self) -> dict:
         with self._lock:
@@ -578,11 +592,40 @@ def main() -> int:
     parser.add_argument("--listen", default="127.0.0.1:8792")
     parser.add_argument("--min-ttl-ms", type=int, default=DEFAULT_MIN_TTL_MS)
     parser.add_argument("--max-ttl-ms", type=int, default=DEFAULT_MAX_TTL_MS)
+    parser.add_argument(
+        "--auth-token",
+        default=os.environ.get("BLITTER_LSP_LEASE_TOKEN", ""),
+        help=(
+            "required shared secret for all authority-bearing endpoints. "
+            "Set BLITTER_LSP_LEASE_TOKEN or pass --auth-token; the server "
+            "refuses to start without one. The token is compared with "
+            "hmac.compare_digest on every non-status request."
+        ),
+    )
+    parser.add_argument(
+        "--worker-cgroup",
+        default=os.environ.get("BLITTER_LSP_LEASE_CGROUP", ""),
+        help=(
+            "optional cgroup path of the worker process tree. When set, "
+            "any restart or revoke tears the worker down by signalling the "
+            "cgroup so a stale worker cannot continue producing diagnostics."
+        ),
+    )
     args = parser.parse_args()
+    if not args.auth_token or len(args.auth_token) < 16:
+        print(
+            "blitter-lsp-lease: refusing to start without an --auth-token "
+            "(>=16 chars) or BLITTER_LSP_LEASE_TOKEN. The lease endpoint "
+            "is unsafe to expose unauthenticated.",
+            flush=True,
+        )
+        return 2
     try:
         listen = parse_listen(args.listen)
         state = LSPLeaseState(min_ttl_ms=args.min_ttl_ms, max_ttl_ms=args.max_ttl_ms)
         server = LSPLeaseServer(listen, state)
+        server.auth_token = args.auth_token
+        server.worker_cgroup = args.worker_cgroup
     except (ValueError, OSError) as exc:
         print(f"blitter-lsp-lease: {exc}", flush=True)
         return 2
