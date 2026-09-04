@@ -1,0 +1,22 @@
+# LSP worker image: Python language server (python-lsp-server).
+#
+# BOOTSTRAP BASE: placeholder digest; production must rebuild from a reviewed
+# base and record the published ref in the deployment-owned image policy.
+#
+# Canonical argv (must match lsp_workers.CANONICAL_COMMANDS["python"]):
+#   pylsp
+FROM docker.io/library/python:3.12-slim@sha256:b9c79bdea517ca2cde260952b2ea3628ac64a1e498a9cd677d19b4796fd91280
+
+ENV PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+RUN pip install --no-cache-dir "python-lsp-server[all]==1.12.0" \
+    && pylsp --version \
+    && useradd --uid 65532 --user-group --no-create-home --shell /usr/sbin/nologin lsp \
+    && mkdir -p /workspace && chown 65532:65532 /workspace
+
+USER 65532:65532
+WORKDIR /workspace/source
+HEALTHCHECK --interval=60s --timeout=10s --start-period=30s --retries=3 \
+    CMD ["pylsp", "--version"]
+CMD ["pylsp"]

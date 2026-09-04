@@ -1,0 +1,107 @@
+{
+  "status": "BOOTSTRAP_UNPUBLISHED",
+  "note": "Deployment-owned trust roots for the six LSP worker images. This example ships with deterministic BOOTSTRAP digests under an example registry and the deterministic bootstrap test key d73e5f0a... (seed sha256('blitter-lsp-bootstrap-test-key-v1')); the seed is published here for contract-test use only and MUST NOT sign production catalogs. It is structurally valid for contract tests only. Production deployment MUST replace approved_images with Harbor-published immutable digests, approved_keys with the offline release key, approved_sources with the real worker source repositories, and sbom with the Harbor SBOM attestations, then set status to PUBLISHED_HARBOR. verify_lsp_image_policy.py --require-published enforces this.",
+  "approved_images": {
+    "lean": "harbor.example.invalid/mathpunch/lean-lsp@sha256:5c38e8b5ba7e30151f7abd7fc96b69918e6b37b1678373431b16704ba0cee885",
+    "coq": "harbor.example.invalid/mathpunch/coq-lsp@sha256:35b6a65cd851929bb1055147bb7b6597969da48d5069d14ebeff8060651a8328",
+    "python": "harbor.example.invalid/mathpunch/python-lsp@sha256:7a2cb24c1cbb3eb76641ad8b93d022e06f997629e39c5c4e40366ee96ef38737",
+    "r": "harbor.example.invalid/mathpunch/r-lsp@sha256:c4b2a5096476923ac2311683bb2b9c2e426c81b51225dec989e000e379526e05",
+    "julia": "harbor.example.invalid/mathpunch/julia-lsp@sha256:2d36b952a79464c0c7f4dcd70852fcbb6b03e0101bcabd64993ea12ebfadda71",
+    "rust": "harbor.example.invalid/mathpunch/rust-lsp@sha256:d83370c2ac62cb434dd04c77dba05ebc4c47f3f79ea37e5320c3d31101cae2fd"
+  },
+  "resource_ceilings": {
+    "lean": {
+      "cpus": 4,
+      "memory_mib": 8192
+    },
+    "coq": {
+      "cpus": 4,
+      "memory_mib": 8192
+    },
+    "python": {
+      "cpus": 4,
+      "memory_mib": 8192
+    },
+    "r": {
+      "cpus": 4,
+      "memory_mib": 8192
+    },
+    "julia": {
+      "cpus": 4,
+      "memory_mib": 8192
+    },
+    "rust": {
+      "cpus": 4,
+      "memory_mib": 8192
+    }
+  },
+  "approved_keys": {
+    "blitter-lsp-bootstrap-test-key": "d73e5f0a627d57dbb5ac469b1bab3aed7698ce08a012812d32e1c5f9cf2c146e"
+  },
+  "approved_sources": [
+    "https://example.invalid/mathpunch/lsp-workers"
+  ],
+  "require_sbom": true,
+  "sbom": {
+    "lean": {
+      "schema": "mathpunch.blitter-image-sbom.v1",
+      "language": "lean",
+      "image": "harbor.example.invalid/mathpunch/lean-lsp@sha256:5c38e8b5ba7e30151f7abd7fc96b69918e6b37b1678373431b16704ba0cee885",
+      "sbom_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+      "sbom_media_type": "application/vnd.cyclonedx+json",
+      "source": "https://example.invalid/mathpunch/lsp-workers",
+      "source_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "build_digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+    },
+    "coq": {
+      "schema": "mathpunch.blitter-image-sbom.v1",
+      "language": "coq",
+      "image": "harbor.example.invalid/mathpunch/coq-lsp@sha256:35b6a65cd851929bb1055147bb7b6597969da48d5069d14ebeff8060651a8328",
+      "sbom_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+      "sbom_media_type": "application/vnd.cyclonedx+json",
+      "source": "https://example.invalid/mathpunch/lsp-workers",
+      "source_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "build_digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+    },
+    "python": {
+      "schema": "mathpunch.blitter-image-sbom.v1",
+      "language": "python",
+      "image": "harbor.example.invalid/mathpunch/python-lsp@sha256:7a2cb24c1cbb3eb76641ad8b93d022e06f997629e39c5c4e40366ee96ef38737",
+      "sbom_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+      "sbom_media_type": "application/vnd.cyclonedx+json",
+      "source": "https://example.invalid/mathpunch/lsp-workers",
+      "source_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "build_digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+    },
+    "r": {
+      "schema": "mathpunch.blitter-image-sbom.v1",
+      "language": "r",
+      "image": "harbor.example.invalid/mathpunch/r-lsp@sha256:c4b2a5096476923ac2311683bb2b9c2e426c81b51225dec989e000e379526e05",
+      "sbom_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+      "sbom_media_type": "application/vnd.cyclonedx+json",
+      "source": "https://example.invalid/mathpunch/lsp-workers",
+      "source_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "build_digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+    },
+    "julia": {
+      "schema": "mathpunch.blitter-image-sbom.v1",
+      "language": "julia",
+      "image": "harbor.example.invalid/mathpunch/julia-lsp@sha256:2d36b952a79464c0c7f4dcd70852fcbb6b03e0101bcabd64993ea12ebfadda71",
+      "sbom_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+      "sbom_media_type": "application/vnd.cyclonedx+json",
+      "source": "https://example.invalid/mathpunch/lsp-workers",
+      "source_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "build_digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+    },
+    "rust": {
+      "schema": "mathpunch.blitter-image-sbom.v1",
+      "language": "rust",
+      "image": "harbor.example.invalid/mathpunch/rust-lsp@sha256:d83370c2ac62cb434dd04c77dba05ebc4c47f3f79ea37e5320c3d31101cae2fd",
+      "sbom_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+      "sbom_media_type": "application/vnd.cyclonedx+json",
+      "source": "https://example.invalid/mathpunch/lsp-workers",
+      "source_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "build_digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+    }
+  }
+}

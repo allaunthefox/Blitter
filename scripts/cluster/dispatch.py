@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shlex
@@ -11,6 +12,25 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+
+try:
+    from .lsp_workers import runtime_command as lsp_runtime_command
+    from .lsp_workers import worker_from_mapping
+    from .lsp_workers import podman_signature_policy_flag
+    from .lsp_transport import LeaseHooks, TransportConfig, run_lsp_transport
+    from .lsp_admission import LSPWorkSpec, admit_lsp_work, presence_from_mapping
+    from .image_catalog import validate_catalog
+    from .image_trust import verify_image_trust
+    from .lsp_lease import LSPLeaseClient
+except ImportError:
+    from lsp_workers import runtime_command as lsp_runtime_command
+    from lsp_workers import worker_from_mapping
+    from lsp_workers import podman_signature_policy_flag
+    from lsp_transport import LeaseHooks, TransportConfig, run_lsp_transport
+    from lsp_admission import LSPWorkSpec, admit_lsp_work, presence_from_mapping
+    from image_catalog import validate_catalog
+    from image_trust import verify_image_trust
+    from lsp_lease import LSPLeaseClient
 
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CONFIG = ROOT / "scripts" / "cluster" / "nodes.json"
@@ -76,10 +96,10 @@ def runtime_command(node: Node, image: str, command: list[str], cpus: int, memor
             f"podman run --rm --device nvidia.com/gpu=all --cpus={cpus} --memory={memory_gib}g {image_q} {quoted_command}"
         )
     if node.runtime == "nix-podman":
+        # Deployment-owned signature policy only; no insecure fallback.
         return (
-            "policy=$(mktemp) && trap 'rm -f \"$policy\"' EXIT && "
-            "printf '%s\n' '{\"default\":[{\"type\":\"insecureAcceptAnything\"}]}' > \"$policy\" && "
-            "nix shell nixpkgs#podman --command podman run --signature-policy=\"$policy\" --rm "
+            "nix shell nixpkgs#podman --command podman run "
+            f"{podman_signature_policy_flag()} --rm "
             f"--cpus={cpus} --memory={memory_gib}g {image_q} {quoted_command}"
         )
     raise ValueError(f"node {node.name}: unsupported runtime {node.runtime}")
@@ -122,6 +142,98 @@ def cmd_run(node: Node, args: argparse.Namespace) -> int:
     return result.returncode
 
 
+def cmd_lsp(node: Node, args: argparse.Namespace) -> int:
+    """Run one validated language-server container over SSH."""
+    if node.ephemeral and not args.allow_ephemeral:
+        raise ValueError(f"node {node.name} is ephemeral; pass --allow-ephemeral explicitly")
+    descriptor_payload = json.loads(args.descriptor.read_text(encoding="utf-8"))
+    spec = worker_from_mapping(descriptor_payload)
+    if spec.cpus > node.max_cpus:
+        raise ValueError(f"CPU request exceeds {node.name} cap ({node.max_cpus})")
+    if spec.memory_gib > node.max_memory_gib:
+        raise ValueError(f"memory request exceeds {node.name} cap ({node.max_memory_gib} GiB)")
+    catalog_path = getattr(args, "catalog", None)
+    if catalog_path is not None:
+        policy_path = getattr(args, "catalog_policy", None)
+        if policy_path is None:
+            raise ValueError("--catalog requires --catalog-policy")
+        catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
+        policy = json.loads(policy_path.read_text(encoding="utf-8"))
+        if not isinstance(policy, dict):
+            raise ValueError("catalog policy must be a JSON object")
+        if "approved_keys" in policy:
+            # Deployment-owned trust roots: verify signature, provenance
+            # allowlist, and SBOM bindings, not just catalog shape.
+            verify_image_trust(catalog, policy)
+        else:
+            approved_images = policy.get("approved_images")
+            resource_ceilings = policy.get("resource_ceilings")
+            validate_catalog(
+                catalog,
+                approved_images=approved_images,
+                resource_ceilings=resource_ceilings,
+            )
+        entry = catalog["images"][spec.language]
+        if entry["image"] != spec.image or tuple(entry["argv"]) != spec.command:
+            raise ValueError("LSP descriptor does not match catalog language entry")
+    remote = lsp_runtime_command(node.runtime, spec)
+    if getattr(args, "interactive", False):
+        presence_path = getattr(args, "presence", None)
+        if presence_path is None:
+            raise ValueError("interactive LSP requires --presence")
+        now_unix_ms = int(__import__("time").time() * 1000)
+        presence = presence_from_mapping(
+            json.loads(presence_path.read_text(encoding="utf-8")),
+            now_unix_ms=now_unix_ms,
+        )
+        decision = admit_lsp_work(
+            LSPWorkSpec(
+                goal_id="dispatch",
+                work_id=f"lsp:{spec.language}",
+                language=spec.language,
+                required_capabilities=frozenset({"lsp", f"language:{spec.language}"}),
+                cpus=spec.cpus,
+                memory_gib=spec.memory_gib,
+                lease_ttl_ms=int(args.total_timeout * 1000),
+            ),
+            presence,
+            now_unix_ms=now_unix_ms,
+        )
+        if not decision.admitted or decision.node_id != node.name:
+            raise ValueError(f"LSP presence does not admit node {node.name}")
+        if args.lease_url is None:
+            raise ValueError("interactive LSP requires --lease-url")
+        image_digest = spec.image.rsplit("@", 1)[-1]
+        lease_client = LSPLeaseClient(
+            args.lease_url,
+            goal_id="dispatch",
+            work_id=f"lsp:{spec.language}",
+            worker_id=node.name,
+            worker_generation=args.worker_generation,
+            descriptor_digest="sha256:" + hashlib.sha256(
+                json.dumps(descriptor_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            ).hexdigest(),
+            image_digest=image_digest,
+            holder=args.lease_holder,
+            ttl_ms=args.lease_ttl_ms,
+        )
+        return run_lsp_transport(
+            node.destination,
+            "exec " + remote,
+            config=TransportConfig(
+                startup_timeout=args.startup_timeout,
+                idle_timeout=args.idle_timeout,
+                total_timeout=args.total_timeout,
+                lease_renew_interval=args.lease_ttl_ms / 3000,
+            ),
+            lease_hooks=LeaseHooks(lease_client.acquire, lease_client.release, lease_client.renew),
+        )
+    result = ssh(node, remote, timeout=args.timeout)
+    sys.stdout.write(result.stdout)
+    sys.stderr.write(result.stderr)
+    return result.returncode
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
@@ -136,6 +248,28 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--gpu", action="store_true")
     run.add_argument("--allow-ephemeral", action="store_true")
     run.add_argument("command", nargs=argparse.REMAINDER)
+    lsp = sub.add_parser("lsp", help="run a validated containerized language server")
+    lsp.add_argument("node")
+    lsp.add_argument("--descriptor", type=Path, required=True)
+    lsp.add_argument("--catalog", type=Path,
+                     help="optional six-language catalog used to check descriptor drift")
+    lsp.add_argument("--catalog-policy", type=Path,
+                     help="deployment-owned approved images/resource ceilings for --catalog")
+    lsp.add_argument("--timeout", type=int, default=1800)
+    lsp.add_argument("--interactive", action="store_true",
+                     help="stream LSP stdin/stdout over SSH instead of buffering")
+    lsp.add_argument("--startup-timeout", type=float, default=15.0)
+    lsp.add_argument("--idle-timeout", type=float, default=300.0)
+    lsp.add_argument("--total-timeout", type=float, default=1800.0)
+    lsp.add_argument("--presence", type=Path,
+                     help="fresh JSON LSP presence record; required for --interactive")
+    lsp.add_argument("--lease-url", type=str,
+                     help="target LSP lease endpoint; required for --interactive")
+    lsp.add_argument("--lease-ttl-ms", type=int, default=30000)
+    lsp.add_argument("--lease-holder", default="cluster-dispatch")
+    lsp.add_argument("--worker-generation", type=int, default=0,
+                     help="worker generation identity announced by announce_presence.py")
+    lsp.add_argument("--allow-ephemeral", action="store_true")
     wg = sub.add_parser("webgpu")
     wg.add_argument("node")
     wg.add_argument("--health", action="store_true")
@@ -170,6 +304,8 @@ def main() -> int:
             return cmd_inventory(nodes)
         if args.action == "webgpu":
             return cmd_webgpu(nodes, args)
+        if args.action == "lsp":
+            return cmd_lsp(nodes[args.node], args)
         if not args.command:
             raise ValueError("container command is required after --")
         return cmd_run(nodes[args.node], args)

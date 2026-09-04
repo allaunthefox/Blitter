@@ -1,0 +1,23 @@
+# LSP worker image: rust-analyzer language server.
+#
+# BOOTSTRAP BASE: placeholder digest; production must rebuild from a reviewed
+# base and record the published ref in the deployment-owned image policy.
+#
+# Canonical argv (must match lsp_workers.CANONICAL_COMMANDS["rust"]):
+#   rust-analyzer
+FROM docker.io/library/rust:1.83-slim-bookworm@sha256:01603bcfb78e50f16627bcf72b9c3bd656215bab7ccb2a9492c070c67ab87d5a
+
+ENV RUSTUP_HOME=/opt/rustup \
+    CARGO_HOME=/opt/cargo \
+    PATH=/opt/cargo/bin:/usr/local/bin:/usr/bin:/bin
+
+RUN rustup component add rust-analyzer \
+    && rust-analyzer --version \
+    && useradd --uid 65532 --user-group --no-create-home --shell /usr/sbin/nologin lsp \
+    && mkdir -p /workspace && chown 65532:65532 /workspace
+
+USER 65532:65532
+WORKDIR /workspace/source
+HEALTHCHECK --interval=60s --timeout=10s --start-period=30s --retries=3 \
+    CMD ["rust-analyzer", "--version"]
+CMD ["rust-analyzer"]

@@ -10,3 +10,5 @@ benchmark-results/
 *.pem
 *.key
 *.secret
+.lake/
+lake-manifest.json

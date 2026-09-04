@@ -17,13 +17,19 @@ This README describes the branch `feat/webgpu-blitter-occupancy-status`. It deli
 | Static `nodes.json` inventory | Implemented | Configuration hints only; never live presence |
 | SSH inventory probes | Implemented | Read-only host observation when SSH is configured/reachable |
 | Direct bounded container dispatch | Implemented for `docker`, `nix-podman`, and `podman-nvidia-cdi` | Executes explicitly requested work on those configured runtime types |
+| Containerized LSP dispatch | Implemented as `dispatch.py lsp` | Validates a digest-pinned, networkless worker; interactive mode additionally requires fresh matching presence and a target-side lease |
+| Target-side LSP lease service (`lsp_lease_server.py`) | Implemented; deployment topology is operator concern | Atomic acquire/renew/release with fencing, restart invalidation, and race tests; consumed by `lsp_lease.py` and `dispatch.py lsp --interactive` |
+| LSP image trust (`image_trust.py`) | Implemented; production digests/keys are deployment-owned | Ed25519 catalog signatures, provenance allowlists, SBOM bindings; `insecureAcceptAnything` removed, Podman paths require `BLITTER_PODMAN_SIGNATURE_POLICY` |
+| Hardened workspace execution (`workspace_execution.py`) | Implemented | Canonicalized paths, symlink-escape rejection, per-job source/build/cache/output mounts, non-root launch, quotas, no devices, `--pull=never`, guaranteed per-job cleanup |
+| Language worker images (`workers/`) | Bootstrap Containerfiles for lean/coq/python/r/julia/rust; publication is deployment-dependent | Pinned bases, non-root user, HEALTHCHECK, canonical CMD, presence announcer with generation identity; `--require-published` blocks bootstrap publication |
+| MathPunch binding (`mathpunch_binding.py`) | Implemented | Diagnostics/artifacts bound to project/commit/toolchain/verifier/request digests; direct kernel replay is the sole authority |
 | Inventory entries with `runtime: auto` or `runtime: bare` | **Not supported by `dispatch.py run`** | Inventory/other specialized paths only unless a runtime handler is added |
 | `GET /health` client | Implemented; endpoint deployment-dependent | Daemon liveness only |
 | `GET /status` validation and `--require-idle` | Implemented in client; endpoint deployment-dependent | Observational occupancy only; not ownership |
 | Heartbeat wire v3 | Implemented in `blitter_heartbeat.py` | Advisory presence/load/hardware/timing state |
 | Slot filtering/ranking/migration decision | Implemented in `slot_scheduler.py` | Advisory placement decision only |
 | Expected-duration / overrun telemetry | Implemented in `lease_protocol.py` | Capacity/anomaly telemetry only; **not fencing** |
-| Target-side atomic lease/fencing | **Required architecture; not implemented by the current Python helpers** | Must exist and be verified before lease-required routing is authoritative |
+| Target-side atomic lease/fencing (WebGPU blitter) | Implemented in `experiments/webgpu_blitter/lease_gate.py`; deployment topology is operator concern | Must be deployed in front of a loopback-only daemon before lease-required routing is authoritative |
 | Mathematical result promotion | Outside scheduler authority | Still governed by the applicable MathPunch verifier/authority chain |
 
 Do not infer that a currently deployed daemon exposes every branch endpoint. Verify the target version before relying on `/status` or any future lease interface.
@@ -87,6 +93,7 @@ python3 scripts/cluster/dispatch.py webgpu <node> \
 | File | Purpose |
 | --- | --- |
 | `dispatch.py` | Static inventory, bounded SSH/container dispatch, WebGPU health/status/current compute client |
+| `lsp_workers.py` | Digest-pinned, networkless language-server descriptor validation and container command rendering |
 | `blitter_heartbeat.py` | Unicast UDP heartbeat announcer/listener with load, hardware, uptime, expiry, skew, and sequence telemetry |
 | `slot_scheduler.py` | Converts fresh heartbeats to slot pools, filters/ranks compatible pools, and proposes migration decisions |
 | `lease_protocol.py` | Expected-duration and profound-overrun telemetry; despite the filename, it does not grant/fence leases |
@@ -105,7 +112,7 @@ Keep the state transitions distinct:
 configured
     -> fresh heartbeat
         -> compatible available slot
-            -> target-side lease grant   [required for full authority; not implemented here]
+            -> target-side lease grant   [implemented: `lsp_lease_server.py` for LSP sessions, `experiments/webgpu_blitter/lease_gate.py` for WebGPU compute]
                 -> execute
                     -> receipt/checkpoint
 ```

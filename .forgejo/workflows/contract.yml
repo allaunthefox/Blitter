@@ -1,0 +1,176 @@
+name: Blitter contract
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  cluster-contract:
+    name: Cluster Python contracts
+    runs-on: ubuntu-latest
+    container: python:3.12-slim
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+      - name: Run cluster protocol tests
+        run: |
+          set -eu
+          python3 scripts/cluster/test_blitter_heartbeat.py
+          python3 scripts/cluster/test_slot_scheduler.py
+          python3 scripts/cluster/test_lease_protocol.py
+          python3 scripts/cluster/test_dispatch_fencing.py
+          python3 scripts/cluster/test_spawn_semantics.py
+      - name: Run workspace and MathPunch binding tests
+        run: |
+          set -eu
+          python3 scripts/cluster/test_workspace_execution.py
+          python3 scripts/cluster/test_mathpunch_binding.py
+
+  lease-service:
+    name: Target-side LSP lease service
+    runs-on: ubuntu-latest
+    container: python:3.12-slim
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+      - name: Run lease state, fencing, and race tests
+        run: |
+          set -eu
+          python3 scripts/cluster/test_lsp_lease_server.py
+      - name: Exercise the lease server over loopback HTTP
+        run: |
+          set -eu
+          python3 scripts/cluster/lsp_lease_server.py --listen 127.0.0.1:8792 &
+          SERVER_PID=$!
+          trap 'kill $SERVER_PID' EXIT
+          sleep 1
+          python3 - <<'PY'
+          import json
+          import urllib.request
+
+          health = json.load(urllib.request.urlopen("http://127.0.0.1:8792/health", timeout=10))
+          assert health["ok"] and health["service"] == "blitter-lsp-lease", health
+          status = json.load(urllib.request.urlopen("http://127.0.0.1:8792/lsp/lease/status", timeout=10))
+          assert status["ok"] and not status["lease_active"], status
+          assert "lease_token" not in json.dumps(status)
+          print("lease server loopback smoke: ok")
+          PY
+
+  syntax:
+    name: Python and shell syntax
+    runs-on: ubuntu-latest
+    container: python:3.12-slim
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+      - name: Compile Python without writing bytecode
+        run: |
+          set -eu
+          python3 - <<'PY'
+          import pathlib
+
+          roots = (pathlib.Path("scripts"), pathlib.Path("experiments"))
+          files = sorted(path for root in roots for path in root.rglob("*.py"))
+          for path in files:
+              compile(path.read_bytes(), str(path), "exec")
+          print(f"compiled {len(files)} Python files")
+          PY
+      - name: Check shell syntax
+        run: |
+          set -eu
+          for script in scripts/cluster/*.sh experiments/webgpu_blitter/*.sh scripts/cluster/workers/*.sh; do
+            bash -n "$script"
+          done
+      - name: Refuse insecure container signature policy
+        run: |
+          set -eu
+          if grep -rn "insecureAcceptAnything" --include="*.py" scripts/ experiments/ MathPunchFiniteState/; then
+            echo "insecure container policy still present" >&2
+            exit 1
+          fi
+          echo "no insecure container policy"
+
+  lsp-image-catalog:
+    name: LSP and image catalog contracts
+    runs-on: ubuntu-latest
+    container: python:3.12-slim
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+      - name: Run LSP descriptor, dispatch, admission, and transport tests
+        run: |
+          set -eu
+          python3 scripts/cluster/test_lsp_workers.py
+          python3 scripts/cluster/test_lsp_dispatch.py
+          python3 scripts/cluster/test_lsp_admission.py
+          python3 scripts/cluster/test_lsp_transport.py
+      - name: Run worker image and presence tests
+        run: |
+          set -eu
+          python3 scripts/cluster/test_worker_images.py
+      - name: Run image provenance catalog tests
+        run: |
+          set -eu
+          python3 scripts/cluster/test_image_provenance.py
+          python3 scripts/cluster/test_image_catalog.py
+      - name: Run image trust verification tests
+        run: |
+          set -eu
+          python3 scripts/cluster/test_image_trust.py
+      - name: Verify example catalog against the example policy
+        run: |
+          set -eu
+          python3 scripts/cluster/sign_lsp_catalog.py verify \
+            --catalog scripts/cluster/lsp_image_catalog.example.json \
+            --policy scripts/cluster/lsp_image_policy.example.json
+      - name: Refuse bootstrap digests for production
+        run: |
+          set -eu
+          if python3 scripts/cluster/sign_lsp_catalog.py verify \
+            --catalog scripts/cluster/lsp_image_catalog.example.json \
+            --policy scripts/cluster/lsp_image_policy.example.json \
+            --require-published; then
+            echo "bootstrap policy accepted as published" >&2
+            exit 1
+          fi
+          if scripts/cluster/workers/build_workers.sh --require-published harbor.example.invalid; then
+            echo "bootstrap worker publication accepted" >&2
+            exit 1
+          fi
+          echo "bootstrap publication correctly refused"
+      - name: Validate static node catalog syntax
+        run: python3 -m json.tool scripts/cluster/nodes.json >/dev/null
+
+  lean:
+    name: Root Lean lake build
+    runs-on: ubuntu-latest
+    container: leanprover/lean4:v4.31.0
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+      - name: Build the Blitter U192 transport witness
+        working-directory: MathPunchFiniteState
+        run: |
+          set -eu
+          lake build
+
+  isa-profile:
+    name: ISA profile mechanical gate
+    runs-on: ubuntu-latest
+    container: python:3.12-slim
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+      - name: Run the frozen profile gate
+        run: |
+          set -eu
+          python3 scripts/verify_blitter_isa_profile.py
+          python3 scripts/test_blitter_isa_profile.py
+
+# Harbor publication/deployment, SSH inventory and dispatch, live daemon checks,
+# and GPU execution are deployment-dependent. They do not belong in this
+# credential-free contract lane.

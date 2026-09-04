@@ -350,10 +350,14 @@ def remote_runtime_command(worker: Worker, workspace: str, module: str, job: dic
             f"sh -lc '{setup} && {command}'"
         )
     if worker.runtime == "nix-podman":
+        # Deployment-owned signature policy only; no insecure fallback.
+        try:
+            from .lsp_workers import podman_signature_policy_flag
+        except ImportError:
+            from lsp_workers import podman_signature_policy_flag
         return (
-            "policy=$(mktemp) && trap 'rm -f \"$policy\"' EXIT && "
-            "printf '%s\n' '{\"default\":[{\"type\":\"insecureAcceptAnything\"}]}' > \"$policy\" && "
-            "nix shell nixpkgs#podman --command podman run --signature-policy=\"$policy\" --rm "
+            "nix shell nixpkgs#podman --command podman run "
+            f"{podman_signature_policy_flag()} --rm "
             f"--cpus={job['cpus']} --memory={job['memory_gib']}g "
             f"-v {workspace}:/work:ro -v {workspace}/output:/output -w /work {image} "
             f"sh -lc '{setup} && {command}'"
