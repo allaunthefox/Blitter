@@ -622,7 +622,32 @@ def main() -> int:
         return 2
     try:
         listen = parse_listen(args.listen)
-        state = LSPLeaseState(min_ttl_ms=args.min_ttl_ms, max_ttl_ms=args.max_ttl_ms)
+
+        def _signal_cgroup() -> None:
+            """Signal the worker cgroup to tear down on revoke/expire/restart."""
+            cgroup = args.worker_cgroup
+            if not cgroup:
+                return
+            with contextlib.suppress(FileNotFoundError, ProcessLookupError, PermissionError, OSError):
+                # Linux cgroup v2: write "1" to cgroup.kill to signal every process.
+                try:
+                    with open(cgroup.rstrip("/") + "/cgroup.kill", "w") as fh:
+                        fh.write("1")
+                    return
+                except FileNotFoundError:
+                    pass
+                # Fallback: signal every PID in cgroup.procs.
+                pids = []
+                with open(cgroup.rstrip("/") + "/cgroup.procs") as fh:
+                    pids = [int(line) for line in fh.read().split() if line.strip().isdigit()]
+                for pid in pids:
+                    with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
+                        os.kill(pid, 15)  # SIGTERM first.
+                return
+
+        state = LSPLeaseState(
+            min_ttl_ms=args.min_ttl_ms, max_ttl_ms=args.max_ttl_ms, on_revoke=_signal_cgroup,
+        )
         server = LSPLeaseServer(listen, state)
         server.auth_token = args.auth_token
         server.worker_cgroup = args.worker_cgroup
@@ -644,11 +669,22 @@ def main() -> int:
         ),
         flush=True,
     )
+    import atexit
+    # On graceful shutdown (including a new server starting), the instance_id
+    # is already invalid.  Tear the worker down so it cannot continue
+    # producing diagnostics against a released lease.
+    def _shutdown() -> None:
+        try:
+            _signal_cgroup()
+        except Exception:
+            pass
+    atexit.register(_shutdown)
     try:
         server.serve_forever(poll_interval=0.2)
     except KeyboardInterrupt:
         pass
     finally:
+        _shutdown()
         server.server_close()
     return 0
 
