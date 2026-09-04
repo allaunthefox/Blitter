@@ -10,7 +10,8 @@ accessibility**:
 
 - `GET /health` answers whether the daemon and selected adapter are alive.
 - `GET /status` answers whether the daemon currently owns or is waiting for its compute critical section and, on the updated branch source, reports the narrow execution surface that the daemon itself has established.
-- `POST /compute` retains the Laurent-product request/response contract.
+- `POST /compute-envelope` is the only execution route; legacy Laurent
+  `POST /compute` is not exposed.
 - `scripts/cluster/blitter_heartbeat.py` can actively announce validated `/status` snapshots to explicit network peers without changing the compute ABI.
 
 The controlled-spawn model is defined in
@@ -291,13 +292,16 @@ Inspect without submitting work:
 python3 scripts/cluster/dispatch.py webgpu nixos-laptop --status
 ```
 
-Require an idle observation before a single job:
+Submit a canonical v2 envelope through the fenced dispatcher:
 
 ```bash
-python3 scripts/cluster/dispatch.py webgpu nixos-laptop --require-idle --job-file job.json
+python3 scripts/cluster/dispatch.py webgpu nixos-laptop \
+  --lease-ttl-ms 1000 --envelope-file request-v2.json
 ```
 
-For a batch, `--require-idle` rechecks before every item. The dispatcher fails closed if `/status` is unavailable, malformed, internally inconsistent, reports `ok=false`, or reports any active/queued compute.
+`--require-idle` and `--job-file` are not dispatcher flags. The dispatcher
+acquires a target-side lease for each envelope and fails closed if lease or
+canonical result validation fails.
 
 The dispatcher also honors the optional per-node `webgpu_port` field from `scripts/cluster/nodes.json`; otherwise it uses port 8790.
 
@@ -312,7 +316,7 @@ The status endpoint and heartbeat provide **observability and placement evidence
 - Strict exclusion needs an atomic reservation/lease endpoint, or all compute submissions must pass through one scheduler that owns the device lease.
 - Decoded output remains candidate/evidence until the applicable MathPunch verifier promotes it.
 
-The daemon serializes its own `/compute` requests through one process-wide GPU mutex, so simultaneous callers are visible as one active request plus queued requests rather than silently overlapping inside the daemon.
+The daemon serializes `/compute-envelope` requests through one process-wide GPU mutex, so simultaneous callers are visible as one active request plus queued requests rather than silently overlapping inside the daemon.
 
 ## Build/deploy provenance
 

@@ -9,6 +9,22 @@ GATE_LISTEN="${BLITTER_GATE_LISTEN:-0.0.0.0:8790}"
 LEASE_MIN_TTL_MS="${BLITTER_LEASE_MIN_TTL_MS:-100}"
 LEASE_MAX_TTL_MS="${BLITTER_LEASE_MAX_TTL_MS:-3600000}"
 
+require_digest() {
+  local name="$1" value="${!1:-}"
+  if [[ ! "$value" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+    echo "blitter-stack: $name must be sha256:<64 lowercase hex>" >&2
+    exit 2
+  fi
+}
+
+require_positive() {
+  local name="$1" value="${!1:-}"
+  if [[ ! "$value" =~ ^[1-9][0-9]*$ ]]; then
+    echo "blitter-stack: $name must be a positive integer" >&2
+    exit 2
+  fi
+}
+
 case "$INNER_BIND" in
   127.0.0.1:*) ;;
   *)
@@ -16,6 +32,23 @@ case "$INNER_BIND" in
     exit 2
     ;;
 esac
+
+# Refuse to start a gate whose only upstream cannot admit canonical envelopes.
+# These values are deployment-owned, but must be present in this process and
+# inherited by the daemon rather than discovered after accepting traffic.
+: "${BLITTER_ENVELOPE_PROFILE_ID:?blitter-stack: BLITTER_ENVELOPE_PROFILE_ID is required}"
+require_digest BLITTER_ENVELOPE_PROFILE_DIGEST
+require_digest BLITTER_ENVELOPE_TERMINAL_CONTRACT_DIGEST
+require_digest BLITTER_ENVELOPE_ASSEMBLER_MODULE_DIGEST
+require_positive BLITTER_ENVELOPE_MAX_CPUS
+require_positive BLITTER_ENVELOPE_MAX_MEMORY_MIB
+require_positive BLITTER_ENVELOPE_MAX_WALL_MS
+if [ "$BLITTER_ENVELOPE_PROFILE_ID" != "BLITTER-ISA-V1" ] \
+  || [ "$BLITTER_ENVELOPE_PROFILE_DIGEST" != "sha256:cd60e19d6c3652e08d4ed36e3f8208de7f5d2c553cb7e8f5123175c63ff2f129" ] \
+  || [ "$BLITTER_ENVELOPE_TERMINAL_CONTRACT_DIGEST" != "sha256:5a9804978698791d50d937ba93b7f279344b2e0ea658f4e2ee7b2d5a3365fb7f" ]; then
+  echo "blitter-stack: envelope profile and terminal contract must match the deployed registry binding" >&2
+  exit 2
+fi
 
 export BLITTER_BIND="$INNER_BIND"
 

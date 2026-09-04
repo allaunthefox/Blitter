@@ -6,7 +6,7 @@
 
 ## 1. Purpose
 
-`GET /status` is observational and cannot close the time-of-check/time-of-use race between “idle” and `POST /compute`. V1 therefore places a target-side **fencing gate** in front of a loopback-only blitter daemon.
+`GET /status` is observational and cannot close the time-of-check/time-of-use race between “idle” and `POST /compute-envelope`. V1 therefore places a target-side **fencing gate** in front of a loopback-only blitter daemon.
 
 Recommended deployment stack:
 
@@ -26,7 +26,7 @@ blitter-lease-gate                      authoritative ownership boundary
 blitter-daemon                          arithmetic backend
 ```
 
-For an authority-bearing fenced deployment, direct network access to the inner daemon is forbidden. The daemon must bind only to loopback (for example `127.0.0.1:8791`) and the gate is the only path allowed to submit `/compute`.
+For an authority-bearing fenced deployment, direct network access to the inner daemon is forbidden. The daemon must bind only to loopback (for example `127.0.0.1:8791`) and the gate is the only path allowed to submit `/compute-envelope`.
 
 If clients can bypass the gate and reach the daemon directly, this specification provides **no exclusive-ownership claim**.
 
@@ -94,9 +94,9 @@ Requires exact current identity and a new `ttl_ms`. Renewal is allowed only **be
 
 Requires exact current identity. If no computation is in flight, release clears the lease immediately. If a computation is in flight, release marks it revoked: the gate blocks a replacement lease until that computation returns, and its result is fenced at commit.
 
-### `POST /compute`
+### `POST /compute-envelope`
 
-The compute body is the existing daemon compute body. Lease identity is carried in headers:
+The compute body is the canonical v2 computation envelope. Lease identity is carried in headers:
 
 ```text
 X-Blitter-Lease-Instance: <instance_id>

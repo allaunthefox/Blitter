@@ -153,11 +153,12 @@ class ControlledUpstreamHandler(BaseHTTPRequestHandler):
         return
 
     def do_POST(self):
-        if self.path != "/compute":
+        if self.path not in {"/compute", "/compute-envelope"}:
             self.send_error(404)
             return
         n = int(self.headers.get("Content-Length", "0"))
         body = self.rfile.read(n)
+        self.server.seen_paths.append(self.path)
         self.server.seen_bodies.append(body)
         self.server.started.set()
         self.server.release.wait(timeout=5)
@@ -177,6 +178,7 @@ class ControlledUpstream(ThreadingHTTPServer):
         self.started = threading.Event()
         self.release = threading.Event()
         self.seen_bodies = []
+        self.seen_paths = []
         self.thread = threading.Thread(target=self.serve_forever, daemon=True)
         self.thread.start()
 
@@ -243,19 +245,25 @@ class LeaseGateLoopbackTests(unittest.TestCase):
         self.gate.close()
         self.upstream.close()
 
-    def test_compute_requires_lease_and_preserves_body(self):
+    def test_legacy_compute_route_is_not_forwarded(self):
         status, body = self.gate.request("POST", "/compute", {"a": [], "b": []})
+        self.assertEqual(status, 404)
+        self.assertFalse(body["ok"])
+
+    def test_compute_envelope_uses_same_fence_and_preserves_distinct_path(self):
+        status, body = self.gate.request("POST", "/compute-envelope", {"envelope": True})
         self.assertEqual(status, 400)
         self.assertFalse(body["ok"])
 
         lease = self.gate.acquire()
         self.upstream.release.set()
-        payload = {"a": [[0, 0, 1]], "b": [[0, 0, 1]]}
+        payload = {"envelope": True}
         status, body = self.gate.request(
-            "POST", "/compute", payload, headers=self.gate.headers(lease)
+            "POST", "/compute-envelope", payload, headers=self.gate.headers(lease)
         )
         self.assertEqual(status, 200)
         self.assertTrue(body["ok"])
+        self.assertEqual(self.upstream.seen_paths[-1], "/compute-envelope")
         self.assertEqual(
             json.loads(self.upstream.seen_bodies[-1].decode("utf-8")), payload
         )
@@ -267,7 +275,7 @@ class LeaseGateLoopbackTests(unittest.TestCase):
         def run_compute():
             result["response"] = self.gate.request(
                 "POST",
-                "/compute",
+                "/compute-envelope",
                 {"a": [], "b": []},
                 headers=self.gate.headers(lease),
                 timeout=5,
@@ -303,7 +311,7 @@ class LeaseGateLoopbackTests(unittest.TestCase):
 
         def run_compute():
             result["response"] = self.gate.request(
-                "POST", "/compute", {"a": [], "b": []}, headers=self.gate.headers(lease)
+                "POST", "/compute-envelope", {"envelope": True}, headers=self.gate.headers(lease)
             )
 
         thread = threading.Thread(target=run_compute)

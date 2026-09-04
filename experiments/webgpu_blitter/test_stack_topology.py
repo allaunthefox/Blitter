@@ -35,6 +35,12 @@ class FencedImageTopologyTests(unittest.TestCase):
         self.assertIn('kill "$gate_pid" "$daemon_pid"', self.entrypoint)
         self.assertNotIn('exec /usr/local/bin/blitter-daemon', self.entrypoint)
 
+    def test_supervisor_requires_registry_bound_envelope_policy_before_starting(self):
+        self.assertIn('BLITTER_ENVELOPE_PROFILE_ID is required', self.entrypoint)
+        self.assertIn('require_digest BLITTER_ENVELOPE_PROFILE_DIGEST', self.entrypoint)
+        self.assertIn('require_positive BLITTER_ENVELOPE_MAX_WALL_MS', self.entrypoint)
+        self.assertIn('must match the deployed registry binding', self.entrypoint)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,0 +1,21 @@
+{
+  "schema": "mathpunch.blitter-wasm-component-manifest.v1",
+  "component_id": "mcp-u192-assembler",
+  "module": "registry.example.invalid/mathpunch/mcp-u192-assembler@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "wit": "mathpunch:blitter-blob@1.0.0",
+  "entrypoint": "mathpunch:blitter-blob/assembler#assemble",
+  "imports": [],
+  "capabilities": {
+    "network": false,
+    "filesystem": "none",
+    "process": false,
+    "devices": []
+  },
+  "limits": {
+    "memory_mib": 64,
+    "fuel": 1000000,
+    "wall_ms": 1000,
+    "output_bytes": 1048576
+  },
+  "authority": "none"
+}

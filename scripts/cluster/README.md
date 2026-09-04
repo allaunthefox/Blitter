@@ -25,7 +25,7 @@ This README describes the branch `feat/webgpu-blitter-occupancy-status`. It deli
 | MathPunch binding (`mathpunch_binding.py`) | Implemented | Diagnostics/artifacts bound to project/commit/toolchain/verifier/request digests; direct kernel replay is the sole authority |
 | Inventory entries with `runtime: auto` or `runtime: bare` | **Not supported by `dispatch.py run`** | Inventory/other specialized paths only unless a runtime handler is added |
 | `GET /health` client | Implemented; endpoint deployment-dependent | Daemon liveness only |
-| `GET /status` validation and `--require-idle` | Implemented in client; endpoint deployment-dependent | Observational occupancy only; not ownership |
+| `GET /status` validation | Implemented in client; endpoint deployment-dependent | Observational occupancy only; not ownership |
 | Heartbeat wire v3 | Implemented in `blitter_heartbeat.py` | Advisory presence/load/hardware/timing state |
 | Slot filtering/ranking/migration decision | Implemented in `slot_scheduler.py` | Advisory placement decision only |
 | Expected-duration / overrun telemetry | Implemented in `lease_protocol.py` | Capacity/anomaly telemetry only; **not fencing** |
@@ -83,16 +83,18 @@ python3 scripts/cluster/dispatch.py webgpu <node> --health
 python3 scripts/cluster/dispatch.py webgpu <node> --status
 ```
 
-`--health` and `--status` contact real network services. The following form additionally submits a real `/compute` request:
+`--health` and `--status` contact real network services. Execution requires a
+canonical envelope and an authoritative lease:
 
 ```bash
 python3 scripts/cluster/dispatch.py webgpu <node> \
-  --require-idle \
-  --a 1,0,2 0,1,3 \
-  --b 1,0,5 0,0,7
+  --lease-ttl-ms 30000 \
+  --envelope-file request.canonical.json
 ```
 
-`--require-idle` is a fail-closed observational gate only. Another client can race between the status read and `POST /compute`; this path does **not** implement atomic slot ownership.
+The dispatcher acquires and releases the target-side lease around
+`POST /compute-envelope`; status is observational only and does not grant
+execution ownership.
 
 ## Components
 
@@ -114,8 +116,10 @@ python3 scripts/cluster/dispatch.py webgpu <node> \
 | `slot_scheduler.py` | Converts fresh heartbeats to slot pools, filters/ranks compatible pools, and proposes migration decisions |
 | `lease_protocol.py` | Expected-duration and profound-overrun telemetry; despite the filename, it does not grant/fence leases |
 | `nodes.json` | Static inventory hints; not proof that a node is present or schedulable |
+| `node_bootstrap_plan.py` | Local-only renderer for reviewed Tailscale/SSH, rootless runtime, device, and mechanics-runner bootstrap requirements; it reads active `nodes.json`, never archived derived inventory. Each node must supply a dedicated non-root `runner_user`. |
+| `node_readiness.py` | Local-only fail-closed preflight report for the Docker Harbor deployment contract. It binds an active eligible bootstrap inventory/plan, non-root runner, canonical stamped provenance and immutable image, locally hashed runtime/gate policies, canonical v2 envelope policy, and an operator-recorded SSH host-key fingerprint. It never opens SSH or reads credentials. |
 | `harbor_push.sh` | Build/publish helper; verify source/artifact and credentials before use |
-| `harbor_deploy.sh` | Deployment helper; use only under an explicit rollout decision |
+| `harbor_deploy.sh` | Docker-only deployment helper. It consumes an eligible active bootstrap plan and requires a verified provenance stamp, local runtime image-trust policy reference/digest, and local published-gate access-control reference/digest; use only under an explicit rollout decision. |
 | `test_blitter_heartbeat.py` | Heartbeat/identity/expiry/timing regression tests |
 | `test_slot_scheduler.py` | Slot eligibility/rental/migration regression tests |
 | `test_lease_protocol.py` | Expected-duration/overrun telemetry tests |
@@ -184,6 +188,36 @@ Configured resource caps fail closed. GPU requests are rejected for CPU-only rol
 
 `runtime: auto` and `runtime: bare` entries do **not** make `dispatch.py run` auto-detect or execute a container. Add a supported runtime handler or use the appropriate specialized service instead.
 
+### Bootstrap review plan
+
+Render local operator requirements without opening SSH, contacting a node, or reading credentials:
+
+```bash
+python3 scripts/cluster/node_bootstrap_plan.py
+```
+
+Only explicitly declared `docker`, `nix-podman`, and `podman-nvidia-cdi` nodes with a supplied dedicated non-root `runner_user` can produce plans. The renderer reports every rejected node with a remediation; `auto`, `bare`, missing runner identities, and `root` are never inferred or given host-execution commands. A rendered plan is a review artifact, not proof of Tailscale reachability, SSH authorization, runtime health, or current node presence.
+
+### Deployment readiness review
+
+Before an operator considers the Docker-only `harbor_deploy.sh` path, validate a
+local manifest:
+
+```bash
+python3 scripts/cluster/node_readiness.py --manifest /absolute/path/readiness.json --output /absolute/path/readiness-report.json
+```
+
+Start from `scripts/cluster/node_readiness_manifest.example.json`; its placeholder
+values are intentionally rejected until replaced.
+
+The manifest contains only local file references and review values: node name,
+expected `SHA256:...` SSH host-key fingerprint, canonical provenance path,
+runtime image-trust policy path/digest, published-gate access policy path/digest,
+and all v2 envelope policy values. A report is ready only when all values bind;
+it is not evidence of host reachability, host-key observation, policy deployment,
+or authorization. Record the host fingerprint out of band and pin it in the
+operator SSH configuration before any connection.
+
 ## WebGPU daemon interface
 
 Liveness:
@@ -211,13 +245,8 @@ max_concurrent_compute
 
 Inconsistent counters/booleans fail closed.
 
-The current `/compute` client uses sparse bivariate/Laurent-style integer terms:
-
-```text
-[q_exp, t_exp, coefficient]
-```
-
-This is a specific codec surface. It is **not** an arbitrary-WGSL submission API.
+The deployable client accepts only canonical computation-envelope bytes. It is
+not an arbitrary-WGSL or sparse Laurent-term submission API.
 
 ## Heartbeat receiver
 
@@ -347,7 +376,7 @@ A real authoritative lease TTL/expiry belongs to the target-side atomic lease/fe
 - Do not store SSH keys, registry credentials, API tokens, signing keys, or secrets in this directory.
 - Static inventory is not trusted as live state.
 - Heartbeats and `/status` are advisory routing evidence, not ownership.
-- `--require-idle` does not close the check/submit race.
+- `/status` does not close the check/submit race; envelope execution acquires a target-side lease.
 - A future lease token/fencing epoch must be validated by the execution target, not merely recorded by the client.
 - Compute output remains within its declared exact/advisory scope until consumed by the applicable MathPunch verification/authority path.
 - Deployment helpers can mutate live infrastructure; treat them as explicit operator actions, not test commands.
@@ -408,7 +437,7 @@ lease revoke could continue producing diagnostics against a stale lease.
 | `unsupported runtime` from `dispatch.py run` | The inventory runtime is not one of the three direct handlers; use a supported/specialized path or add a handler with tests |
 | SSH user “not configured” | Resolve the referenced environment variable; do not put credentials into `nodes.json` |
 | `/health` works but `/status` is 404/invalid | The deployed daemon does not match the occupancy-status contract; do not infer idleness |
-| `/status` says busy or has queued work | Do not submit through `--require-idle`; reassess another slot |
+| `/status` says busy or has queued work | Do not infer execution authority; acquire a target-side lease or reassess another slot |
 | heartbeat status read fails | Announcement fails closed as unusable capacity |
 | stale heartbeat / TTL expired | Historical only; exclude from placement |
 | `time_anomaly=true` or epoch/1969 timestamp | Fix sender/receiver clock before routing |

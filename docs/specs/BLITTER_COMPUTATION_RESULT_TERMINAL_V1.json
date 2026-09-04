@@ -1,0 +1,1 @@
+{"authority":"none","contract_id":"mathpunch.blitter-computation-result-terminal.v1","malformed_request":{"result_bytes":"none","treatment":"reject"},"result":{"payload":{"codec":"mathpunch.u192-canonical.v1"},"status_bytes":"none"},"schema":"mathpunch.blitter-terminal-contract.v1","statuses":[{"code":null,"name":"accepted","state_payload":"canonical-result"}]}

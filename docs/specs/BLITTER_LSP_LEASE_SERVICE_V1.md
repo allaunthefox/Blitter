@@ -14,7 +14,7 @@ in_flight serialization) but operate at different scopes:
 | Dimension | WebGPU lease gate (`BLITTER_LEASE_FENCING_V1`) | LSP lease service (this spec) |
 |---|---|---|
 | Scope | One compute request | One interactive LSP session |
-| Compute path | `POST /compute` (HTTP body) | SSH tunneled LSP protocol (byte-transparent) |
+| Compute path | `POST /compute-envelope` (canonical v2 HTTP body) | SSH tunneled LSP protocol (byte-transparent) |
 | Fence point | Commit at result return | `session_commit` before diagnostics may be committed |
 | Expiry action | Discard result bytes, return 409 | Raise `LeaseProtocolError`, diagnostics dropped |
 

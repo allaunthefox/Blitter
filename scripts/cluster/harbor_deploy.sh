@@ -3,15 +3,14 @@
 #
 # The published image is expected to expose the target-side lease gate on 8790
 # while the arithmetic daemon binds only to 127.0.0.1:8791 inside the container.
-# Host port 8790 binds to the node's configured tailnet IP by default, never
-# 0.0.0.0. For a website-facing node set BLITTER_PUBLISH_ADDR=127.0.0.1 and put
-# the drop-in TLS security plugin in front of that loopback endpoint.
+# This helper only consumes an active, eligible Docker bootstrap plan. It does
+# not configure a runtime, an account, image trust, or published-gate access.
 #
 # Usage: ./scripts/cluster/harbor_deploy.sh <node> <provenance.json>
-# Optional secure provenance verification:
-#   BLITTER_REQUIRE_DEPLOY_STAMP=1
-#   BLITTER_SECURITY_PLUGIN=/abs/path/to/blitter-security-plugin
-#   BLITTER_TRUSTED_STAMP_KEY=/abs/path/to/public-ed25519.pem
+# Required local operator inputs: BLITTER_SECURITY_PLUGIN,
+# BLITTER_TRUSTED_STAMP_KEY, BLITTER_RUNTIME_IMAGE_TRUST_POLICY,
+# BLITTER_RUNTIME_IMAGE_TRUST_POLICY_DIGEST, BLITTER_PUBLISHED_GATE_ACCESS_POLICY,
+# BLITTER_PUBLISHED_GATE_ACCESS_POLICY_DIGEST, and BLITTER_PUBLISH_ADDR.
 set -euo pipefail
 
 [ "$#" -eq 2 ] || {
@@ -27,28 +26,66 @@ PROVENANCE_CODEC="$ROOT/scripts/cluster/image_provenance.py"
 [ -f "$PROVENANCE" ] || { echo "missing provenance file: $PROVENANCE" >&2; exit 2; }
 [ -f "$PROVENANCE_CODEC" ] || { echo "missing provenance codec: $PROVENANCE_CODEC" >&2; exit 2; }
 
-for tool in python3 ssh; do
+require_digest() {
+  local name="$1" value="${!1:-}"
+  [[ "$value" =~ ^sha256:[0-9a-f]{64}$ ]] || {
+    echo "$name must be sha256:<64 lowercase hex>" >&2
+    exit 2
+  }
+}
+require_positive() {
+  local name="$1" value="${!1:-}"
+  [[ "$value" =~ ^[1-9][0-9]*$ ]] || {
+    echo "$name must be a positive integer" >&2
+    exit 2
+  }
+}
+require_verified_reference() {
+  local path_name="$1" digest_name="$2" path="${!1:-}" expected="${!2:-}" actual
+  : "${!path_name:?$path_name is required}"
+  case "$path" in /*) ;; *) echo "$path_name must be absolute" >&2; exit 3;; esac
+  [ -f "$path" ] && [ -r "$path" ] || { echo "$path_name must name a readable local policy file" >&2; exit 3; }
+  require_digest "$digest_name"
+  actual="sha256:$(sha256sum "$path" | cut -d' ' -f1)"
+  [ "$actual" = "$expected" ] || { echo "$path_name digest does not match $digest_name" >&2; exit 3; }
+}
+
+: "${BLITTER_ENVELOPE_PROFILE_ID:?BLITTER_ENVELOPE_PROFILE_ID is required}"
+require_digest BLITTER_ENVELOPE_PROFILE_DIGEST
+require_digest BLITTER_ENVELOPE_TERMINAL_CONTRACT_DIGEST
+require_digest BLITTER_ENVELOPE_ASSEMBLER_MODULE_DIGEST
+require_positive BLITTER_ENVELOPE_MAX_CPUS
+require_positive BLITTER_ENVELOPE_MAX_MEMORY_MIB
+require_positive BLITTER_ENVELOPE_MAX_WALL_MS
+if [ "$BLITTER_ENVELOPE_PROFILE_ID" != "BLITTER-ISA-V1" ] \
+  || [ "$BLITTER_ENVELOPE_PROFILE_DIGEST" != "sha256:cd60e19d6c3652e08d4ed36e3f8208de7f5d2c553cb7e8f5123175c63ff2f129" ] \
+  || [ "$BLITTER_ENVELOPE_TERMINAL_CONTRACT_DIGEST" != "sha256:5a9804978698791d50d937ba93b7f279344b2e0ea658f4e2ee7b2d5a3365fb7f" ]; then
+  echo "envelope profile and terminal contract must match the deployed registry binding" >&2
+  exit 2
+fi
+
+for tool in python3 ssh sha256sum; do
   command -v "$tool" >/dev/null 2>&1 || { echo "required tool missing: $tool" >&2; exit 2; }
 done
 
-if [ "${BLITTER_REQUIRE_DEPLOY_STAMP:-0}" = 1 ]; then
-  : "${BLITTER_SECURITY_PLUGIN:?BLITTER_SECURITY_PLUGIN is required for stamped deployment}"
-  : "${BLITTER_TRUSTED_STAMP_KEY:?BLITTER_TRUSTED_STAMP_KEY is required for stamped deployment}"
-  case "$BLITTER_SECURITY_PLUGIN" in /*) ;; *) echo "BLITTER_SECURITY_PLUGIN must be absolute" >&2; exit 3;; esac
-  case "$BLITTER_TRUSTED_STAMP_KEY" in /*) ;; *) echo "BLITTER_TRUSTED_STAMP_KEY must be absolute" >&2; exit 3;; esac
-  [ -x "$BLITTER_SECURITY_PLUGIN" ] || { echo "security plugin not executable" >&2; exit 3; }
-  STAMP="$PROVENANCE.stamp.json"
-  [ -f "$STAMP" ] || { echo "required provenance stamp missing: $STAMP" >&2; exit 3; }
-  "$BLITTER_SECURITY_PLUGIN" handshake | python3 -c '
+ : "${BLITTER_SECURITY_PLUGIN:?BLITTER_SECURITY_PLUGIN is required}"
+ : "${BLITTER_TRUSTED_STAMP_KEY:?BLITTER_TRUSTED_STAMP_KEY is required}"
+case "$BLITTER_SECURITY_PLUGIN" in /*) ;; *) echo "BLITTER_SECURITY_PLUGIN must be absolute" >&2; exit 3;; esac
+case "$BLITTER_TRUSTED_STAMP_KEY" in /*) ;; *) echo "BLITTER_TRUSTED_STAMP_KEY must be absolute" >&2; exit 3;; esac
+[ -x "$BLITTER_SECURITY_PLUGIN" ] || { echo "security plugin not executable" >&2; exit 3; }
+STAMP="$PROVENANCE.stamp.json"
+[ -f "$STAMP" ] || { echo "required provenance stamp missing: $STAMP" >&2; exit 3; }
+"$BLITTER_SECURITY_PLUGIN" handshake | python3 -c '
 import json,sys
 h=json.load(sys.stdin)
 assert h.get("abi")=="mathpunch.blitter-security-plugin.v1"
 assert "verify.ed25519.sha256" in h.get("capabilities", [])
 ' || { echo "security plugin does not satisfy verify capability" >&2; exit 3; }
-  "$BLITTER_SECURITY_PLUGIN" verify \
-    --stamp "$(python3 -c 'import os,sys; print(os.path.abspath(sys.argv[1]))' "$STAMP")" \
-    --public-key "$BLITTER_TRUSTED_STAMP_KEY" < "$PROVENANCE" >/dev/null
-fi
+"$BLITTER_SECURITY_PLUGIN" verify \
+  --stamp "$(python3 -c 'import os,sys; print(os.path.abspath(sys.argv[1]))' "$STAMP")" \
+  --public-key "$BLITTER_TRUSTED_STAMP_KEY" < "$PROVENANCE" >/dev/null
+require_verified_reference BLITTER_RUNTIME_IMAGE_TRUST_POLICY BLITTER_RUNTIME_IMAGE_TRUST_POLICY_DIGEST
+require_verified_reference BLITTER_PUBLISHED_GATE_ACCESS_POLICY BLITTER_PUBLISHED_GATE_ACCESS_POLICY_DIGEST
 
 readarray -t META < <(
   python3 "$PROVENANCE_CODEC" validate \
@@ -61,22 +98,37 @@ IMAGE_DIGEST="${META[1]}"
 SOURCE_COMMIT="${META[2]}"
 PROFILE_DIGEST="${META[3]}"
 
-ADDR=$(python3 - "$NODE" "$ROOT/scripts/cluster/nodes.json" <<'PY'
+python3 - "$PROVENANCE" <<'PY'
 import json, sys
-name, path = sys.argv[1:]
-d = json.load(open(path))
-for n in d["nodes"]:
-    if n["name"] == name:
-        print(n["address"])
-        break
-else:
-    raise SystemExit(f"unknown node: {name}")
+if json.load(open(sys.argv[1], encoding="utf-8")).get("secure_stamp", {}).get("requested") is not True:
+    raise SystemExit("provenance must declare the required secure stamp")
+PY
+
+readarray -t BOOTSTRAP < <(python3 - "$ROOT" "$NODE" <<'PY'
+import json, sys
+from pathlib import Path
+root, name = sys.argv[1:]
+sys.path.insert(0, str(Path(root) / "scripts" / "cluster"))
+from node_bootstrap_plan import render_bootstrap_plan
+plan = render_bootstrap_plan(json.loads((Path(root) / "scripts" / "cluster" / "nodes.json").read_text()))
+node = next((item for item in plan["plans"] if item["name"] == name), None)
+if node is None:
+    rejected = next((item for item in plan["blockers"] if item["name"] == name), None)
+    raise SystemExit(f"node {name!r} has no active eligible bootstrap plan: {rejected!r}")
+if node["runtime"] != "docker":
+    raise SystemExit(f"node {name!r} runtime={node['runtime']!r} is unsupported by harbor_deploy.sh")
+print(node["address"])
+print(node["runner_user"])
 PY
 )
+ [ "${#BOOTSTRAP[@]}" -eq 2 ] || { echo "active bootstrap plan did not return address and runner user" >&2; exit 2; }
+ADDR="${BOOTSTRAP[0]}"
+RUNNER_USER="${BOOTSTRAP[1]}"
 
-# Default exposure is tailnet-only. The only admitted override is loopback, which
-# is the intended secure-website mode: TLS sidecar :443 -> 127.0.0.1:8790.
-PUBLISH_ADDR="${BLITTER_PUBLISH_ADDR:-$ADDR}"
+# The access-control reference above is the approval boundary. Only the
+# operator-supplied configured address or loopback may be rendered here.
+: "${BLITTER_PUBLISH_ADDR:?BLITTER_PUBLISH_ADDR is required}"
+PUBLISH_ADDR="$BLITTER_PUBLISH_ADDR"
 python3 - "$ADDR" "$PUBLISH_ADDR" <<'PY'
 import ipaddress, sys
 target = ipaddress.ip_address(sys.argv[1])
@@ -91,7 +143,7 @@ PY
 # only after a live status endpoint proves no work/lease is active. Unknown status
 # blocks. Try the intended publish address, configured tailnet address, then
 # loopback to support safe replacement of historical deployment modes.
-ssh -o BatchMode=yes "root@$ADDR" \
+ssh -o BatchMode=yes "$RUNNER_USER@$ADDR" \
   "TARGET_ADDR='$ADDR' PUBLISH_ADDR='$PUBLISH_ADDR' bash -s" <<'REMOTE_PREFLIGHT'
 set -euo pipefail
 if docker inspect -f '{{.State.Running}}' blitter-daemon 2>/dev/null | grep -qx true; then
@@ -147,32 +199,40 @@ fi
 REMOTE_PREFLIGHT
 
 echo "==> pulling immutable image $IMAGE_REF"
-ssh -o BatchMode=yes "root@$ADDR" "docker pull '$IMAGE_REF' >/dev/null"
+ssh -o BatchMode=yes "$RUNNER_USER@$ADDR" "docker pull '$IMAGE_REF' >/dev/null"
 
 # Replacement occurs only after the independent preflight. The digest-bound image
 # itself enforces daemon-loopback + lease-gate topology. Only gate port 8790 is
 # published, and only on tailnet or explicit loopback.
-ssh -o BatchMode=yes "root@$ADDR" bash -s -- "$NODE" "$IMAGE_REF" "$PUBLISH_ADDR" <<'REMOTE_DEPLOY'
+ssh -o BatchMode=yes "$RUNNER_USER@$ADDR" bash -s -- \
+  "$NODE" "$IMAGE_REF" "$PUBLISH_ADDR" \
+  "$BLITTER_ENVELOPE_PROFILE_ID" "$BLITTER_ENVELOPE_PROFILE_DIGEST" \
+  "$BLITTER_ENVELOPE_TERMINAL_CONTRACT_DIGEST" "$BLITTER_ENVELOPE_ASSEMBLER_MODULE_DIGEST" \
+  "$BLITTER_ENVELOPE_MAX_CPUS" "$BLITTER_ENVELOPE_MAX_MEMORY_MIB" \
+  "$BLITTER_ENVELOPE_MAX_WALL_MS" <<'REMOTE_DEPLOY'
 set -euo pipefail
 NODE="$1"
 IMAGE_REF="$2"
 PUBLISH_ADDR="$3"
-extra=()
-case "$NODE" in
-  nasfox)
-    extra+=(--device /dev/dri --device /dev/dri/renderD128)
-    ;;
-  nixos-laptop)
-    extra+=(--device /dev/dri --env BLITTER_ADAPTER=RADV)
-    ;;
-esac
-
+PROFILE_ID="$4"
+PROFILE_DIGEST="$5"
+TERMINAL_CONTRACT_DIGEST="$6"
+ASSEMBLER_MODULE_DIGEST="$7"
+MAX_CPUS="$8"
+MAX_MEMORY_MIB="$9"
+MAX_WALL_MS="${10}"
 docker rm -f blitter-daemon 2>/dev/null || true
 docker run -d \
   --name blitter-daemon \
   --publish "$PUBLISH_ADDR:8790:8790" \
   --restart unless-stopped \
-  "${extra[@]}" \
+  --env "BLITTER_ENVELOPE_PROFILE_ID=$PROFILE_ID" \
+  --env "BLITTER_ENVELOPE_PROFILE_DIGEST=$PROFILE_DIGEST" \
+  --env "BLITTER_ENVELOPE_TERMINAL_CONTRACT_DIGEST=$TERMINAL_CONTRACT_DIGEST" \
+  --env "BLITTER_ENVELOPE_ASSEMBLER_MODULE_DIGEST=$ASSEMBLER_MODULE_DIGEST" \
+  --env "BLITTER_ENVELOPE_MAX_CPUS=$MAX_CPUS" \
+  --env "BLITTER_ENVELOPE_MAX_MEMORY_MIB=$MAX_MEMORY_MIB" \
+  --env "BLITTER_ENVELOPE_MAX_WALL_MS=$MAX_WALL_MS" \
   "$IMAGE_REF" >/dev/null
 
 # The externally published endpoint must be the lease gate, not the raw daemon.
@@ -209,8 +269,6 @@ echo "    immutable image:  $IMAGE_REF"
 echo "    source commit:    $SOURCE_COMMIT"
 echo "    ISA profile:      $PROFILE_DIGEST"
 echo "    registry digest:  $IMAGE_DIGEST"
-if [ "$PUBLISH_ADDR" = "127.0.0.1" ] || [ "$PUBLISH_ADDR" = "::1" ]; then
-  echo "    mode:             loopback-only gate; attach TLS security plugin for website exposure"
-else
-  echo "    mode:             tailnet-only gate"
-fi
+echo "    runner:           $RUNNER_USER (from active bootstrap plan)"
+echo "    image trust:      verified local policy reference"
+echo "    gate access:      verified local access-control reference"

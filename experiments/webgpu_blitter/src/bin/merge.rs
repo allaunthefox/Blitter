@@ -190,19 +190,19 @@ fn run_merge(job: &serde_json::Value) {
 
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("merge"),
-        source: wgpu::ShaderSource::Wgsl(include_str!("merge.wgsl").into()),
+        source: wgpu::ShaderSource::Wgsl(include_str!("../merge.wgsl").into()),
     });
     let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("bgl"),
         entries: &[
-            bind_storage(&device, 0),
-            bind_storage(&device, 1),
-            bind_storage(&device, 2),
-            bind_storage(&device, 3),
-            bind_storage(&device, 4),
-            bind_storage(&device, 5),
-            bind_storage(&device, 6),
-            bind_storage(&device, 7),
+            bind_storage(0),
+            bind_storage(1),
+            bind_storage(2),
+            bind_storage(3),
+            bind_storage(4),
+            bind_storage(5),
+            bind_storage(6),
+            bind_storage(7),
         ],
     });
     let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -219,11 +219,6 @@ fn run_merge(job: &serde_json::Value) {
         cache: None,
     });
 
-    let job_s = MergeJob { n_suffix, slice_start, slice_count };
-    let job_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("job"), contents: bytemuck::bytes_of(&job_s),
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-    });
     let mk = |label: &str, data: &[u32]| {
         device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some(label), contents: bytemuck::cast_slice(data),
@@ -258,7 +253,6 @@ fn run_merge(job: &serde_json::Value) {
     let mut processed = 0u32;
     while processed < slice_count {
         let n = ((slice_count - processed) as usize).min(chunk);
-        let off = processed as usize * 8 * 4;
         let job_c = MergeJob { n_suffix, slice_start: processed, slice_count: n as u32 };
         let job_c_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("jobc"), contents: bytemuck::bytes_of(&job_c),
@@ -335,7 +329,7 @@ fn lex_gt(a: &[u32; 6], b: &[u32; 6]) -> bool {
     false
 }
 
-fn bind_storage(device: &wgpu::Device, binding: u32) -> wgpu::BindGroupLayoutEntry {
+fn bind_storage(binding: u32) -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry {
         binding,
         visibility: wgpu::ShaderStages::COMPUTE,

@@ -1,0 +1,16 @@
+{
+  "assembler": {
+    "interface": "wasi-preview2-component-v1",
+    "module_digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+  },
+  "left_words": [1, 0, 0, 0, 0, 0],
+  "profile_digest": "sha256:cd60e19d6c3652e08d4ed36e3f8208de7f5d2c553cb7e8f5123175c63ff2f129",
+  "request_id": "mcp-1",
+  "resource_budget": {
+    "cpus": 1,
+    "memory_mib": 64,
+    "wall_ms": 1000
+  },
+  "right_words": [2, 0, 0, 0, 0, 0],
+  "terminal_contract_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+}

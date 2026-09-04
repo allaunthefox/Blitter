@@ -1,7 +1,7 @@
-// HTTP WebGPU Laurent daemon with observable occupancy.
+// Canonical-envelope WebGPU daemon with observable occupancy.
 //
-// The daemon preserves the existing /health and /compute contract and adds
-// GET /status so schedulers can observe whether the single GPU critical
+// The daemon exposes /health, /status, and /compute-envelope. Status lets
+// schedulers observe whether the single GPU critical
 // section is active or has queued work. Status is observational, not a lease:
 // callers that require exclusion still need an atomic reservation protocol.
 //
@@ -9,7 +9,6 @@
 // establishes a working WebGPU API surface; it does not establish control of
 // the host kernel, container runtime, physical accelerator, or provider.
 
-use std::collections::BTreeMap;
 use std::env;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -17,13 +16,21 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use wgpu::util::DeviceExt;
+use serde::Deserialize;
+use sha2::{Digest, Sha256};
 
-const WIDTH: usize = 8;
-const N: u32 = 64;
 const MAX_BODY_BYTES: usize = 1 << 20;
 const SPAWN_SEMANTICS_VERSION: u32 = 1;
 const ACCESSIBILITY_PROFILE: &str = "sandbox";
+const ENVELOPE_SCHEMA: &str = "mathpunch.blitter-computation-envelope.v2";
+const ENVELOPE_OPERATION: &str = "u192.add-mod";
+const ENVELOPE_PROFILE_ID: &str = "BLITTER-ISA-V1";
+const ENVELOPE_PROFILE_DIGEST: &str = "sha256:cd60e19d6c3652e08d4ed36e3f8208de7f5d2c553cb7e8f5123175c63ff2f129";
+const ENVELOPE_TERMINAL_CONTRACT_DIGEST: &str = "sha256:5a9804978698791d50d937ba93b7f279344b2e0ea658f4e2ee7b2d5a3365fb7f";
+const U192_ABI_CODEC: &str = "mathpunch.u192-abi.v1";
+const U192_RESULT_CODEC: &str = "mathpunch.u192-canonical.v1";
+const ENVELOPE_RESULT_SCHEMA: &str = "mathpunch.blitter-computation-result.v1";
+const ASSEMBLER_INTERFACE: &str = "wasi-preview2-component-v1";
 
 struct DebugTrace {
     enabled: bool,
@@ -64,25 +71,7 @@ impl DebugTrace {
     }
 }
 
-#[repr(C)]
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
-struct Term {
-    qe: u32,
-    te: u32,
-    coef: i32,
-    valid: u32,
-}
-
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-struct Triple {
-    qe: u32,
-    te: u32,
-    coef: i32,
-}
-
 struct GpuContext {
-    device: wgpu::Device,
-    queue: wgpu::Queue,
     adapter_name: String,
     backend_name: String,
     device_type: String,
@@ -165,6 +154,7 @@ impl RuntimeState {
         self.bump();
     }
 
+    #[cfg(test)]
     fn is_busy(&self) -> bool {
         self.active_compute.load(Ordering::Acquire) != 0
             || self.queued_compute.load(Ordering::Acquire) != 0
@@ -275,7 +265,6 @@ fn spawn_contract_json_fields() -> String {
             "\"controlled_subsystems\":[\"accelerator-api\"],",
             "\"execution_surfaces\":[\"webgpu\"],",
             "\"slot_capabilities\":[",
-            "\"exact-i32\",\"laurent-product-v1\",",
             "\"surface:webgpu\",\"webgpu-blitter\"]"
         ),
         SPAWN_SEMANTICS_VERSION,
@@ -293,7 +282,7 @@ fn adapter_priority(device_type: wgpu::DeviceType) -> u8 {
     }
 }
 
-fn request_device(adapter: &wgpu::Adapter) -> Result<(wgpu::Device, wgpu::Queue), String> {
+fn request_device(adapter: &wgpu::Adapter) -> Result<(), String> {
     pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         label: Some("blitter-device"),
         required_features: wgpu::Features::empty(),
@@ -302,6 +291,7 @@ fn request_device(adapter: &wgpu::Adapter) -> Result<(wgpu::Device, wgpu::Queue)
         memory_hints: wgpu::MemoryHints::Performance,
         trace: wgpu::Trace::Off,
     }))
+    .map(|_| ())
     .map_err(|err| format!("request_device: {err}"))
 }
 
@@ -363,15 +353,13 @@ fn init_gpu(debug: &DebugTrace) -> Result<GpuContext, String> {
             ),
         );
         match request_device(&adapter) {
-            Ok((device, queue)) => {
+            Ok(()) => {
                 let adapter_label = format!("{} ({})", adapter_name, backend_name);
                 selected = Some((
                     adapter_name,
                     backend_name,
                     device_type,
                     adapter_label,
-                    device,
-                    queue,
                 ));
                 break;
             }
@@ -387,7 +375,7 @@ fn init_gpu(debug: &DebugTrace) -> Result<GpuContext, String> {
             }
         }
     }
-    let (adapter_name, backend_name, device_type, adapter_label, device, queue) = selected
+    let (adapter_name, backend_name, device_type, adapter_label) = selected
         .ok_or_else(|| "no usable WebGPU adapter".to_string())?;
     debug.event(
         "gpu.adapter_selected",
@@ -400,8 +388,6 @@ fn init_gpu(debug: &DebugTrace) -> Result<GpuContext, String> {
     );
     debug.event("gpu.device_ready", "");
     Ok(GpuContext {
-        device,
-        queue,
         adapter_name,
         backend_name,
         device_type,
@@ -410,403 +396,221 @@ fn init_gpu(debug: &DebugTrace) -> Result<GpuContext, String> {
     })
 }
 
-fn exact_reference(a: &[Triple], b: &[Triple]) -> Result<Vec<Triple>, String> {
-    let mut acc: BTreeMap<(u32, u32), i128> = BTreeMap::new();
-    for left in a {
-        for right in b {
-            let qe = left
-                .qe
-                .checked_add(right.qe)
-                .ok_or_else(|| "q exponent overflow".to_string())?;
-            let te = left
-                .te
-                .checked_add(right.te)
-                .ok_or_else(|| "t exponent overflow".to_string())?;
-            let product = (left.coef as i128) * (right.coef as i128);
-            if product < i32::MIN as i128 || product > i32::MAX as i128 {
-                return Err("coefficient product exceeds exact i32 GPU domain".to_string());
+#[derive(Debug)]
+struct EnvelopePolicy {
+    profile_id: String,
+    profile_digest: String,
+    terminal_contract_digest: String,
+    assembler_module_digest: String,
+    max_cpus: u64,
+    max_memory_mib: u64,
+    max_wall_ms: u64,
+}
+
+impl EnvelopePolicy {
+    fn from_env() -> Result<Self, String> {
+        fn digest(name: &str) -> Result<String, String> {
+            let value = env::var(name).map_err(|_| format!("{name} is required"))?;
+            if !valid_digest(&value) {
+                return Err(format!("{name} must be sha256:<64 lowercase hex>"));
             }
-            *acc.entry((qe, te)).or_insert(0) += product;
+            Ok(value)
         }
-    }
-    let mut out = Vec::new();
-    for ((qe, te), coef) in acc {
-        if coef == 0 {
-            continue;
+        fn positive(name: &str) -> Result<u64, String> {
+            let value = env::var(name).map_err(|_| format!("{name} is required"))?;
+            value
+                .parse::<u64>()
+                .ok()
+                .filter(|value| *value > 0)
+                .ok_or_else(|| format!("{name} must be a positive integer"))
         }
-        if coef < i32::MIN as i128 || coef > i32::MAX as i128 {
-            return Err("reduced coefficient exceeds exact i32 GPU domain".to_string());
-        }
-        out.push(Triple {
-            qe,
-            te,
-            coef: coef as i32,
-        });
-    }
-    Ok(out)
-}
-
-fn padded_terms(input: &[Triple]) -> Result<[Term; WIDTH], String> {
-    if input.len() > WIDTH {
-        return Err(format!("at most {WIDTH} terms are supported per factor"));
-    }
-    let mut out = [Term::default(); WIDTH];
-    for (slot, term) in out.iter_mut().zip(input.iter()) {
-        *slot = Term {
-            qe: term.qe,
-            te: term.te,
-            coef: term.coef,
-            valid: 1,
-        };
-    }
-    Ok(out)
-}
-
-fn gpu_product(gpu: &GpuContext, a: &[Triple], b: &[Triple]) -> Result<Vec<Triple>, String> {
-    let a_terms = padded_terms(a)?;
-    let b_terms = padded_terms(b)?;
-    let device = &gpu.device;
-    let queue = &gpu.queue;
-    let bpp: u32 = 16;
-
-    let tex_a = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("surface-A"),
-        size: wgpu::Extent3d {
-            width: WIDTH as u32,
-            height: 1,
-            depth_or_array_layers: 1,
-        },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Rgba32Uint,
-        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-        view_formats: &[],
-    });
-    let tex_b = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("surface-B"),
-        size: wgpu::Extent3d {
-            width: N,
-            height: 1,
-            depth_or_array_layers: 1,
-        },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Rgba32Uint,
-        usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::COPY_SRC,
-        view_formats: &[],
-    });
-    queue.write_texture(
-        wgpu::TexelCopyTextureInfo {
-            texture: &tex_a,
-            mip_level: 0,
-            origin: wgpu::Origin3d::ZERO,
-            aspect: wgpu::TextureAspect::All,
-        },
-        bytemuck::cast_slice(&a_terms),
-        wgpu::TexelCopyBufferLayout {
-            offset: 0,
-            bytes_per_row: Some(WIDTH as u32 * bpp),
-            rows_per_image: Some(1),
-        },
-        wgpu::Extent3d {
-            width: WIDTH as u32,
-            height: 1,
-            depth_or_array_layers: 1,
-        },
-    );
-
-    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some("laurent-pipeline"),
-        source: wgpu::ShaderSource::Wgsl(include_str!("../blitter.wgsl").into()),
-    });
-    let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("bgl"),
-        entries: &[
-            wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::COMPUTE, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None }, count: None },
-            wgpu::BindGroupLayoutEntry { binding: 1, visibility: wgpu::ShaderStages::COMPUTE, ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Uint, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false }, count: None },
-            wgpu::BindGroupLayoutEntry { binding: 2, visibility: wgpu::ShaderStages::COMPUTE, ty: wgpu::BindingType::StorageTexture { access: wgpu::StorageTextureAccess::WriteOnly, format: wgpu::TextureFormat::Rgba32Uint, view_dimension: wgpu::TextureViewDimension::D2 }, count: None },
-            wgpu::BindGroupLayoutEntry { binding: 3, visibility: wgpu::ShaderStages::COMPUTE, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: false }, has_dynamic_offset: false, min_binding_size: None }, count: None },
-            wgpu::BindGroupLayoutEntry { binding: 4, visibility: wgpu::ShaderStages::COMPUTE, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: false }, has_dynamic_offset: false, min_binding_size: None }, count: None },
-            wgpu::BindGroupLayoutEntry { binding: 5, visibility: wgpu::ShaderStages::COMPUTE, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: false }, has_dynamic_offset: false, min_binding_size: None }, count: None },
-            wgpu::BindGroupLayoutEntry { binding: 6, visibility: wgpu::ShaderStages::COMPUTE, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: false }, has_dynamic_offset: false, min_binding_size: None }, count: None },
-        ],
-    });
-    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some("pl"),
-        bind_group_layouts: &[Some(&bgl)],
-        immediate_size: 0,
-    });
-    let make_pipeline = |label: &str, entry: &str| {
-        device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some(label),
-            layout: Some(&layout),
-            module: &shader,
-            entry_point: Some(entry),
-            compilation_options: Default::default(),
-            cache: None,
+        Ok(Self {
+            profile_id: env::var("BLITTER_ENVELOPE_PROFILE_ID")
+                .map_err(|_| "BLITTER_ENVELOPE_PROFILE_ID is required".to_string())?,
+            profile_digest: digest("BLITTER_ENVELOPE_PROFILE_DIGEST")?,
+            terminal_contract_digest: digest("BLITTER_ENVELOPE_TERMINAL_CONTRACT_DIGEST")?,
+            assembler_module_digest: digest("BLITTER_ENVELOPE_ASSEMBLER_MODULE_DIGEST")?,
+            max_cpus: positive("BLITTER_ENVELOPE_MAX_CPUS")?,
+            max_memory_mib: positive("BLITTER_ENVELOPE_MAX_MEMORY_MIB")?,
+            max_wall_ms: positive("BLITTER_ENVELOPE_MAX_WALL_MS")?,
         })
-    };
-    let p_product = make_pipeline("product", "product_pass");
-    let p_sort = make_pipeline("sort", "sort_pass");
-    let p_reduce = make_pipeline("reduce", "reduce_pass");
-    let p_compact = make_pipeline("compact", "compact_pass");
-
-    let buf_b = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("terms-B"),
-        contents: bytemuck::cast_slice(&b_terms),
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-    });
-    let prods = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("prods"),
-        size: (N * bpp) as u64,
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
-        mapped_at_creation: false,
-    });
-    let finals = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("finals"),
-        contents: &vec![0u8; (N * bpp) as usize],
-        usage: wgpu::BufferUsages::STORAGE,
-    });
-    let final_out = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("finalOut"),
-        contents: &vec![0u8; (N * bpp) as usize],
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-    });
-    let counters = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("counters"),
-        contents: bytemuck::bytes_of(&[0u32, 0u32, 0u32, 0u32]),
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-    });
-    let readback = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("readback"),
-        size: (N * bpp) as u64,
-        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-        mapped_at_creation: false,
-    });
-    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("bg"),
-        layout: &bgl,
-        entries: &[
-            wgpu::BindGroupEntry { binding: 0, resource: buf_b.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&tex_a.create_view(&wgpu::TextureViewDescriptor::default())) },
-            wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&tex_b.create_view(&wgpu::TextureViewDescriptor::default())) },
-            wgpu::BindGroupEntry { binding: 3, resource: prods.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 4, resource: finals.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 5, resource: counters.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 6, resource: final_out.as_entire_binding() },
-        ],
-    });
-
-    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-        label: Some("enc"),
-    });
-    {
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("p1"), timestamp_writes: None });
-        pass.set_pipeline(&p_product);
-        pass.set_bind_group(0, &bind_group, &[]);
-        pass.dispatch_workgroups(N, 1, 1);
     }
-    encoder.copy_texture_to_buffer(
-        wgpu::TexelCopyTextureInfo { texture: &tex_b, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
-        wgpu::TexelCopyBufferInfo { buffer: &prods, layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(N * bpp), rows_per_image: Some(1) } },
-        wgpu::Extent3d { width: N, height: 1, depth_or_array_layers: 1 },
-    );
-    queue.write_buffer(&counters, 0, bytemuck::bytes_of(&[0u32, 0u32, 0u32, 0u32]));
-    for (label, pipeline) in [("p3", &p_sort), ("p4a", &p_reduce), ("p4b", &p_compact)] {
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some(label), timestamp_writes: None });
-        pass.set_pipeline(pipeline);
-        pass.set_bind_group(0, &bind_group, &[]);
-        pass.dispatch_workgroups(1, 1, 1);
-    }
-    encoder.copy_buffer_to_buffer(&final_out, 0, &readback, 0, (N * bpp) as u64);
-    queue.submit(Some(encoder.finish()));
+}
 
-    let slice = readback.slice(..);
-    let (tx, rx) = std::sync::mpsc::channel();
-    slice.map_async(wgpu::MapMode::Read, move |result| {
-        let _ = tx.send(result);
-    });
-    device
-        .poll(wgpu::PollType::Wait { submission_index: None, timeout: None })
-        .map_err(|err| format!("device poll: {err}"))?;
-    rx.recv()
-        .map_err(|err| format!("map callback: {err}"))?
-        .map_err(|err| format!("map readback: {err}"))?;
-    let data = slice.get_mapped_range().map_err(|err| format!("mapped range: {err}"))?;
-    let raw: &[Term] = bytemuck::cast_slice(&data);
-    let mut out: Vec<Triple> = raw
-        .iter()
-        .take(N as usize)
-        .filter(|term| term.valid == 1 && term.coef != 0)
-        .map(|term| Triple { qe: term.qe, te: term.te, coef: term.coef })
-        .collect();
-    drop(data);
-    readback.unmap();
-    out.sort_by_key(|term| (term.qe, term.te));
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EnvelopeRequest {
+    schema: String,
+    request_id: String,
+    operation: String,
+    profile_id: String,
+    profile_digest: String,
+    codec: String,
+    inputs: Vec<TaggedU192>,
+    resource_budget: ResourceBudget,
+    terminal_contract_digest: String,
+    assembler: EnvelopeAssembler,
+    authority: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TaggedU192 {
+    schema: String,
+    format_tag: u8,
+    payload_hex: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResourceBudget {
+    cpus: u64,
+    memory_mib: u64,
+    wall_ms: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EnvelopeAssembler {
+    module_digest: String,
+    interface: String,
+}
+
+fn valid_digest(value: &str) -> bool {
+    value.len() == 71
+        && value.starts_with("sha256:")
+        && value[7..]
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn valid_request_id(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= 128
+        && bytes[0].is_ascii_alphanumeric()
+        && bytes
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._:-".contains(byte))
+}
+
+fn decode_hex_24(value: &str) -> Result<[u8; 24], String> {
+    if value.len() != 48 || !value.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)) {
+        return Err("U192 payload_hex must be 24-byte lowercase hex".to_string());
+    }
+    let mut out = [0u8; 24];
+    for (index, slot) in out.iter_mut().enumerate() {
+        *slot = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16)
+            .map_err(|_| "invalid U192 payload_hex".to_string())?;
+    }
     Ok(out)
 }
 
-fn compute_exact(gpu: &GpuContext, a: &[Triple], b: &[Triple]) -> Result<Vec<Triple>, String> {
-    let expected = exact_reference(a, b)?;
-    let actual = gpu_product(gpu, a, b)?;
-    if actual != expected {
-        return Err(format!(
-            "GPU/CPU exactness mismatch: expected {} terms, got {}",
-            expected.len(),
-            actual.len()
-        ));
+fn decode_tagged_u192(value: &TaggedU192) -> Result<[u32; 6], String> {
+    if value.schema != U192_ABI_CODEC {
+        return Err("tagged U192 schema mismatch".to_string());
     }
-    Ok(actual)
+    if !matches!(value.format_tag, 0x00 | 0x10 | 0x20 | 0x30) {
+        return Err("unsupported or noncanonical U192 format tag".to_string());
+    }
+    let raw = decode_hex_24(&value.payload_hex)?;
+    let big_endian = value.format_tag & 0x10 != 0;
+    let msw_first = value.format_tag & 0x20 != 0;
+    let mut transport_words = [0u32; 6];
+    for (index, word) in transport_words.iter_mut().enumerate() {
+        let bytes: [u8; 4] = raw[index * 4..index * 4 + 4].try_into().expect("fixed slice");
+        *word = if big_endian { u32::from_be_bytes(bytes) } else { u32::from_le_bytes(bytes) };
+    }
+    if msw_first {
+        transport_words.reverse();
+    }
+    Ok(transport_words)
 }
 
-struct JsonCursor<'a> {
-    bytes: &'a [u8],
-    pos: usize,
+fn canonical_json_bytes(value: &serde_json::Value) -> Result<Vec<u8>, String> {
+    let mut bytes = serde_json::to_vec(value).map_err(|error| format!("JSON encode: {error}"))?;
+    bytes.push(b'\n');
+    Ok(bytes)
 }
 
-impl<'a> JsonCursor<'a> {
-    fn new(input: &'a str) -> Self {
-        Self { bytes: input.as_bytes(), pos: 0 }
+fn parse_envelope_request(body: &str, policy: &EnvelopePolicy) -> Result<([u32; 6], [u32; 6]), String> {
+    if !body.is_ascii() {
+        return Err("envelope must be canonical ASCII JSON".to_string());
     }
-
-    fn skip_ws(&mut self) {
-        while self.pos < self.bytes.len() && self.bytes[self.pos].is_ascii_whitespace() {
-            self.pos += 1;
-        }
+    let value: serde_json::Value = serde_json::from_str(body)
+        .map_err(|error| format!("invalid envelope JSON: {error}"))?;
+    if body.as_bytes() != canonical_json_bytes(&value)? {
+        return Err("envelope bytes are not canonical sorted compact JSON with one newline".to_string());
     }
-
-    fn peek(&mut self) -> Option<u8> {
-        self.skip_ws();
-        self.bytes.get(self.pos).copied()
+    let request: EnvelopeRequest = serde_json::from_value(value)
+        .map_err(|error| format!("invalid envelope: {error}"))?;
+    if request.schema != ENVELOPE_SCHEMA
+        || request.operation != ENVELOPE_OPERATION
+        || request.codec != U192_ABI_CODEC
+        || request.authority != "none"
+    {
+        return Err("unsupported computation envelope".to_string());
     }
-
-    fn expect(&mut self, byte: u8) -> Result<(), String> {
-        self.skip_ws();
-        if self.bytes.get(self.pos).copied() == Some(byte) {
-            self.pos += 1;
-            Ok(())
-        } else {
-            Err(format!("expected '{}' at byte {}", byte as char, self.pos))
-        }
+    if !valid_request_id(&request.request_id) {
+        return Err("request_id is invalid".to_string());
     }
-
-    fn string(&mut self) -> Result<String, String> {
-        self.expect(b'"')?;
-        let mut out = String::new();
-        while self.pos < self.bytes.len() {
-            let byte = self.bytes[self.pos];
-            self.pos += 1;
-            match byte {
-                b'"' => return Ok(out),
-                b'\\' => {
-                    let escaped = *self.bytes.get(self.pos).ok_or_else(|| "truncated escape".to_string())?;
-                    self.pos += 1;
-                    match escaped {
-                        b'"' => out.push('"'),
-                        b'\\' => out.push('\\'),
-                        b'/' => out.push('/'),
-                        b'b' => out.push('\u{0008}'),
-                        b'f' => out.push('\u{000c}'),
-                        b'n' => out.push('\n'),
-                        b'r' => out.push('\r'),
-                        b't' => out.push('\t'),
-                        _ => return Err("unsupported JSON string escape".to_string()),
-                    }
-                }
-                b if b.is_ascii_control() => return Err("control byte in JSON string".to_string()),
-                b => out.push(b as char),
-            }
-        }
-        Err("unterminated JSON string".to_string())
+    if request.profile_id != ENVELOPE_PROFILE_ID
+        || policy.profile_id != ENVELOPE_PROFILE_ID
+        || !valid_digest(&request.profile_digest)
+        || request.profile_digest != ENVELOPE_PROFILE_DIGEST
+        || request.profile_digest != policy.profile_digest
+    {
+        return Err("profile identity is not registry-bound and deployment-approved".to_string());
     }
-
-    fn integer(&mut self) -> Result<i64, String> {
-        self.skip_ws();
-        let start = self.pos;
-        if self.bytes.get(self.pos) == Some(&b'-') {
-            self.pos += 1;
-        }
-        let digits = self.pos;
-        while self.pos < self.bytes.len() && self.bytes[self.pos].is_ascii_digit() {
-            self.pos += 1;
-        }
-        if self.pos == digits {
-            return Err(format!("expected integer at byte {start}"));
-        }
-        let text = std::str::from_utf8(&self.bytes[start..self.pos]).map_err(|err| err.to_string())?;
-        text.parse::<i64>().map_err(|err| format!("integer parse: {err}"))
+    if !valid_digest(&request.terminal_contract_digest)
+        || request.terminal_contract_digest != ENVELOPE_TERMINAL_CONTRACT_DIGEST
+        || request.terminal_contract_digest != policy.terminal_contract_digest
+    {
+        return Err("terminal_contract_digest is not deployment-approved".to_string());
     }
-
-    fn term_array(&mut self) -> Result<Vec<Triple>, String> {
-        self.expect(b'[')?;
-        let mut out = Vec::new();
-        if self.peek() == Some(b']') {
-            self.pos += 1;
-            return Ok(out);
-        }
-        loop {
-            self.expect(b'[')?;
-            let qe = self.integer()?;
-            self.expect(b',')?;
-            let te = self.integer()?;
-            self.expect(b',')?;
-            let coef = self.integer()?;
-            self.expect(b']')?;
-            if qe < 0 || qe > u32::MAX as i64 || te < 0 || te > u32::MAX as i64 {
-                return Err("exponents must be u32".to_string());
-            }
-            if coef < i32::MIN as i64 || coef > i32::MAX as i64 {
-                return Err("coefficient must be i32".to_string());
-            }
-            out.push(Triple { qe: qe as u32, te: te as u32, coef: coef as i32 });
-            if out.len() > WIDTH {
-                return Err(format!("at most {WIDTH} terms are supported per factor"));
-            }
-            match self.peek() {
-                Some(b',') => { self.pos += 1; }
-                Some(b']') => { self.pos += 1; break; }
-                _ => return Err(format!("expected ',' or ']' at byte {}", self.pos)),
-            }
-        }
-        Ok(out)
+    if request.assembler.interface != ASSEMBLER_INTERFACE
+        || !valid_digest(&request.assembler.module_digest)
+        || request.assembler.module_digest != policy.assembler_module_digest
+    {
+        return Err("assembler is not deployment-approved".to_string());
     }
+    let budget = request.resource_budget;
+    if budget.cpus == 0
+        || budget.memory_mib == 0
+        || budget.wall_ms == 0
+        || budget.cpus > policy.max_cpus
+        || budget.memory_mib > policy.max_memory_mib
+        || budget.wall_ms > policy.max_wall_ms
+    {
+        return Err("resource_budget exceeds deployment policy".to_string());
+    }
+    if request.inputs.len() != 2 {
+        return Err("u192.add-mod requires exactly two inputs".to_string());
+    }
+    Ok((decode_tagged_u192(&request.inputs[0])?, decode_tagged_u192(&request.inputs[1])?))
 }
 
-fn parse_compute_request(body: &str) -> Result<(Vec<Triple>, Vec<Triple>), String> {
-    let mut cursor = JsonCursor::new(body);
-    cursor.expect(b'{')?;
-    let mut a = None;
-    let mut b = None;
-    if cursor.peek() == Some(b'}') {
-        return Err("compute object must contain a and b".to_string());
+fn add_u192_mod(left: [u32; 6], right: [u32; 6]) -> [u32; 6] {
+    let mut words = [0u32; 6];
+    let mut carry = 0u64;
+    for index in 0..6 {
+        let sum = u64::from(left[index]) + u64::from(right[index]) + carry;
+        words[index] = sum as u32;
+        carry = sum >> 32;
     }
-    loop {
-        let key = cursor.string()?;
-        cursor.expect(b':')?;
-        match key.as_str() {
-            "a" => {
-                if a.is_some() { return Err("duplicate a field".to_string()); }
-                a = Some(cursor.term_array()?);
-            }
-            "b" => {
-                if b.is_some() { return Err("duplicate b field".to_string()); }
-                b = Some(cursor.term_array()?);
-            }
-            _ => return Err(format!("unsupported compute field: {key}")),
-        }
-        match cursor.peek() {
-            Some(b',') => { cursor.pos += 1; }
-            Some(b'}') => { cursor.pos += 1; break; }
-            _ => return Err(format!("expected ',' or '}}' at byte {}", cursor.pos)),
-        }
-    }
-    cursor.skip_ws();
-    if cursor.pos != cursor.bytes.len() {
-        return Err("trailing bytes after compute JSON".to_string());
-    }
-    Ok((a.ok_or_else(|| "missing a field".to_string())?, b.ok_or_else(|| "missing b field".to_string())?))
+    words
+}
+
+fn envelope_result(body: &str, words: [u32; 6]) -> Result<String, String> {
+    let request_digest = format!("sha256:{:x}", Sha256::digest(body.as_bytes()));
+    let value = serde_json::json!({
+        "authority": "none",
+        "codec": U192_RESULT_CODEC,
+        "request_digest": request_digest,
+        "schema": ENVELOPE_RESULT_SCHEMA,
+        "words": words,
+    });
+    String::from_utf8(canonical_json_bytes(&value)?).map_err(|error| error.to_string())
 }
 
 struct HttpRequest {
@@ -877,119 +681,58 @@ fn write_json(stream: &mut TcpStream, status: u16, reason: &str, body: &str) {
     let _ = stream.flush();
 }
 
-fn terms_json(terms: &[Triple]) -> String {
-    terms
-        .iter()
-        .map(|term| format!("[{},{},{}]", term.qe, term.te, term.coef))
-        .collect::<Vec<_>>()
-        .join(",")
-}
-
 fn error_json(gpu: &GpuContext, error: &str) -> String {
     format!(
-        "{{\"ok\":false,\"terms\":[],\"adapter\":\"{}\",\"error\":\"{}\"}}",
+        "{{\"ok\":false,\"adapter\":\"{}\",\"error\":\"{}\"}}",
         json_escape(&gpu.adapter_label),
         json_escape(error)
     )
 }
 
-fn handle_compute(
+fn handle_compute_envelope(
     mut stream: TcpStream,
     request: HttpRequest,
     gpu: Arc<GpuContext>,
     state: Arc<RuntimeState>,
-    debug: &DebugTrace,
+    policy: Arc<Result<EnvelopePolicy, String>>,
 ) {
-    let request_id = state.begin_request();
-    let started = Instant::now();
-    debug.event(
-        "compute.received",
-        &format!(
-            "\"request_id\":{},\"body_bytes\":{}",
-            request_id,
-            request.body.len()
-        ),
-    );
-    let (a, b) = match parse_compute_request(&request.body) {
-        Ok(parsed) => parsed,
+    state.begin_request();
+    let policy = match policy.as_ref() {
+        Ok(policy) => policy,
         Err(error) => {
             state.record_failed_request();
-            debug.event(
-                "compute.rejected",
-                &format!(
-                    "\"request_id\":{},\"reason\":\"{}\"",
-                    request_id,
-                    json_escape(&error)
-                ),
-            );
+            write_json(&mut stream, 503, "Service Unavailable", &error_json(&gpu, error));
+            return;
+        }
+    };
+    let (left, right) = match parse_envelope_request(&request.body, policy) {
+        Ok(inputs) => inputs,
+        Err(error) => {
+            state.record_failed_request();
             write_json(&mut stream, 400, "Bad Request", &error_json(&gpu, &error));
             return;
         }
     };
-    debug.event(
-        "compute.parsed",
-        &format!(
-            "\"request_id\":{},\"a_terms\":{},\"b_terms\":{}",
-            request_id,
-            a.len(),
-            b.len()
-        ),
-    );
-
     state.enter_queue();
-    debug.event("compute.queued", &format!("\"request_id\":{}", request_id));
-    let gpu_lock = match gpu.gate.lock() {
+    let lock = match gpu.gate.lock() {
         Ok(lock) => lock,
         Err(_) => {
             state.leave_queue();
             state.record_failed_request();
-            debug.event(
-                "compute.lock_error",
-                &format!("\"request_id\":{}", request_id),
-            );
-            write_json(&mut stream, 500, "Internal Server Error", &error_json(&gpu, "GPU compute lock poisoned"));
+            write_json(&mut stream, 500, "Internal Server Error", &error_json(&gpu, "compute lock poisoned"));
             return;
         }
     };
     state.leave_queue();
     let mut active = ActiveGuard::new(state);
-    debug.event(
-        "compute.dispatch_started",
-        &format!("\"request_id\":{}", request_id),
-    );
-    let result = compute_exact(&gpu, &a, &b);
-    drop(gpu_lock);
+    let result = envelope_result(&request.body, add_u192_mod(left, right));
+    drop(lock);
     match result {
-        Ok(terms) => {
+        Ok(body) => {
             active.mark_success();
-            debug.event(
-                "compute.completed",
-                &format!(
-                    "\"request_id\":{},\"status\":200,\"terms\":{},\"duration_ms\":{}",
-                    request_id,
-                    terms.len(),
-                    started.elapsed().as_millis()
-                ),
-            );
-            let body = format!(
-                "{{\"ok\":true,\"terms\":[{}],\"adapter\":\"{}\",\"error\":null}}",
-                terms_json(&terms),
-                json_escape(&gpu.adapter_label)
-            );
             write_json(&mut stream, 200, "OK", &body);
         }
-        Err(error) => {
-            debug.event(
-                "compute.failed",
-                &format!(
-                    "\"request_id\":{},\"status\":500,\"duration_ms\":{},\"reason\":\"{}\"",
-                    request_id,
-                    started.elapsed().as_millis(),
-                    json_escape(&error)
-                ),
-            );
-            write_json(&mut stream, 500, "Internal Server Error", &error_json(&gpu, &error));
-        }
+        Err(error) => write_json(&mut stream, 500, "Internal Server Error", &error_json(&gpu, &error)),
     }
 }
 
@@ -998,6 +741,7 @@ fn handle_connection(
     gpu: Arc<GpuContext>,
     state: Arc<RuntimeState>,
     debug: Arc<DebugTrace>,
+    envelope_policy: Arc<Result<EnvelopePolicy, String>>,
 ) {
     let request = match read_http_request(&mut stream) {
         Ok(request) => request,
@@ -1030,7 +774,9 @@ fn handle_connection(
         ("GET", "/status") => {
             write_json(&mut stream, 200, "OK", &state.status_json(&gpu));
         }
-        ("POST", "/compute") => handle_compute(stream, request, gpu, state, &debug),
+        ("POST", "/compute-envelope") => {
+            handle_compute_envelope(stream, request, gpu, state, envelope_policy)
+        }
         _ => write_json(&mut stream, 404, "Not Found", "{\"ok\":false,\"error\":\"not found\"}"),
     }
 }
@@ -1047,6 +793,7 @@ fn main() {
         std::process::exit(1);
     }));
     let state = Arc::new(RuntimeState::new());
+    let envelope_policy = Arc::new(EnvelopePolicy::from_env());
     let bind = env::var("BLITTER_BIND").unwrap_or_else(|_| "127.0.0.1:8791".to_string());
     let listener = TcpListener::bind(&bind).unwrap_or_else(|error| {
         debug.event(
@@ -1071,7 +818,8 @@ fn main() {
                 let gpu = Arc::clone(&gpu);
                 let state = Arc::clone(&state);
                 let debug = Arc::clone(&debug);
-                std::thread::spawn(move || handle_connection(stream, gpu, state, debug));
+                let envelope_policy = Arc::clone(&envelope_policy);
+                std::thread::spawn(move || handle_connection(stream, gpu, state, debug, envelope_policy));
             }
             Err(error) => {
                 debug.event(
@@ -1096,13 +844,6 @@ mod tests {
     }
 
     #[test]
-    fn parses_compute_contract() {
-        let (a, b) = parse_compute_request(r#"{"a":[[0,0,1],[1,0,-2]],"b":[[0,1,3]]}"#).unwrap();
-        assert_eq!(a, vec![Triple { qe: 0, te: 0, coef: 1 }, Triple { qe: 1, te: 0, coef: -2 }]);
-        assert_eq!(b, vec![Triple { qe: 0, te: 1, coef: 3 }]);
-    }
-
-    #[test]
     fn occupancy_transitions_are_fail_closed() {
         let state = RuntimeState::new();
         assert!(!state.is_busy());
@@ -1120,18 +861,6 @@ mod tests {
     }
 
     #[test]
-    fn exact_reference_reduces_and_sorts() {
-        let a = [Triple { qe: 0, te: 0, coef: 1 }, Triple { qe: 1, te: 0, coef: 2 }];
-        let b = [Triple { qe: 0, te: 0, coef: 3 }, Triple { qe: 1, te: 0, coef: -1 }];
-        let out = exact_reference(&a, &b).unwrap();
-        assert_eq!(out, vec![
-            Triple { qe: 0, te: 0, coef: 3 },
-            Triple { qe: 1, te: 0, coef: 5 },
-            Triple { qe: 2, te: 0, coef: -2 },
-        ]);
-    }
-
-    #[test]
     fn spawn_contract_is_narrow_and_portable() {
         let fields = spawn_contract_json_fields();
         assert!(fields.contains("\"spawn_semantics_version\":1"));
@@ -1144,5 +873,55 @@ mod tests {
         assert!(!fields.contains("firmware"));
         assert!(!fields.contains("kvm"));
         assert!(!fields.contains("lxc"));
+    }
+
+    fn test_policy() -> EnvelopePolicy {
+        EnvelopePolicy {
+            profile_id: ENVELOPE_PROFILE_ID.to_string(),
+            profile_digest: ENVELOPE_PROFILE_DIGEST.to_string(),
+            terminal_contract_digest: ENVELOPE_TERMINAL_CONTRACT_DIGEST.to_string(),
+            assembler_module_digest: format!("sha256:{}", "c".repeat(64)),
+            max_cpus: 2,
+            max_memory_mib: 128,
+            max_wall_ms: 1000,
+        }
+    }
+
+    fn envelope(left: &str, right: &str) -> String {
+        format!(concat!(
+            "{{\"assembler\":{{\"interface\":\"wasi-preview2-component-v1\",\"module_digest\":\"sha256:{}\"}},",
+            "\"authority\":\"none\",\"codec\":\"mathpunch.u192-abi.v1\",",
+            "\"inputs\":[{{\"format_tag\":0,\"payload_hex\":\"{}\",\"schema\":\"mathpunch.u192-abi.v1\"}},",
+            "{{\"format_tag\":0,\"payload_hex\":\"{}\",\"schema\":\"mathpunch.u192-abi.v1\"}}],",
+            "\"operation\":\"u192.add-mod\",\"profile_digest\":\"{}\",\"profile_id\":\"BLITTER-ISA-V1\",\"request_id\":\"req-1\",",
+            "\"resource_budget\":{{\"cpus\":1,\"memory_mib\":64,\"wall_ms\":1000}},",
+            "\"schema\":\"mathpunch.blitter-computation-envelope.v2\",",
+            "\"terminal_contract_digest\":\"{}\"}}\n"
+        ), "c".repeat(64), left, right, ENVELOPE_PROFILE_DIGEST, ENVELOPE_TERMINAL_CONTRACT_DIGEST)
+    }
+
+    #[test]
+    fn envelope_addition_wraps_and_binds_canonical_request() {
+        let max = "ff".repeat(24);
+        let one = format!("01{}", "00".repeat(23));
+        let body = envelope(&max, &one);
+        let (left, right) = parse_envelope_request(&body, &test_policy()).unwrap();
+        let words = add_u192_mod(left, right);
+        assert_eq!(words, [0; 6]);
+        let result = envelope_result(&body, words).unwrap();
+        assert!(result.starts_with("{\"authority\":\"none\",\"codec\":"));
+        assert!(result.ends_with('\n'));
+        assert!(result.contains("\"request_digest\":\"sha256:"));
+    }
+
+    #[test]
+    fn envelope_rejects_noncanonical_bytes_policy_and_tags() {
+        let zero = "00".repeat(24);
+        let body = envelope(&zero, &zero);
+        assert!(parse_envelope_request(body.trim_end(), &test_policy()).is_err());
+        let bad_profile = body.replace(ENVELOPE_PROFILE_DIGEST, &format!("sha256:{}", "d".repeat(64)));
+        assert!(parse_envelope_request(&bad_profile, &test_policy()).is_err());
+        let bad_tag = body.replacen("\"format_tag\":0", "\"format_tag\":1", 1);
+        assert!(parse_envelope_request(&bad_tag, &test_policy()).is_err());
     }
 }

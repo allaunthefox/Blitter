@@ -149,11 +149,6 @@ fn main() {
         usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
         mapped_at_creation: false,
     });
-    let sortdbg = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("sortdbg"), size: (N * bpp) as u64,
-        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-        mapped_at_creation: false,
-    });
     let bgl_inst = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("bg"), layout: &bgl,
         entries: &[

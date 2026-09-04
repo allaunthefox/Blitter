@@ -1,0 +1,10 @@
+package mathpunch:blitter-blob@1.0.0;
+
+interface assembler {
+  /// Assemble a canonical, non-authoritative computation envelope.
+  assemble: func(request-json: string) -> result<string, string>;
+}
+
+world blob-assembler {
+  export assembler;
+}

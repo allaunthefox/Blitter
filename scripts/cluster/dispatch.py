@@ -22,6 +22,7 @@ try:
     from .image_catalog import validate_catalog
     from .image_trust import verify_image_trust
     from .lsp_lease import LSPLeaseClient
+    from . import computation_blob
 except ImportError:
     from lsp_workers import runtime_command as lsp_runtime_command
     from lsp_workers import worker_from_mapping
@@ -31,6 +32,7 @@ except ImportError:
     from image_catalog import validate_catalog
     from image_trust import verify_image_trust
     from lsp_lease import LSPLeaseClient
+    import computation_blob
 
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CONFIG = ROOT / "scripts" / "cluster" / "nodes.json"
@@ -345,24 +347,15 @@ def build_parser() -> argparse.ArgumentParser:
     wg.add_argument("--health", action="store_true")
     wg.add_argument("--status", action="store_true",
                     help="report daemon/gate occupancy without submitting compute")
-    wg.add_argument("--require-idle", action="store_true",
-                    help="legacy observational preflight; not an ownership fence")
     wg.add_argument("--lease-ttl-ms", type=int,
-                    help="authoritative target-side lease TTL; default compute path requires this")
+                    help="authoritative target-side lease TTL; required for envelope execution")
     wg.add_argument("--lease-expected-ms", type=int,
                     help="optional advisory expected duration; distinct from authoritative TTL")
     wg.add_argument("--lease-holder",
                     help="lease holder label; default identifies this dispatcher process")
-    wg.add_argument("--allow-unfenced", action="store_true",
-                    help="explicit legacy escape hatch; still requires live idle preflight and has a TOCTOU race")
-    wg.add_argument("--job-file", type=Path)
-    wg.add_argument("--batch-file", type=Path,
-                    help='JSON: {"jobs": [{"a": [[qe,te,coef]...], "b": [...]}, ...]}')
+    wg.add_argument("--envelope-file", type=Path,
+                    help="canonical computation envelope bytes; required for fenced /compute-envelope execution")
     wg.add_argument("--timeout", type=int, default=120)
-    wg.add_argument("--a", nargs="+", default=[],
-                    help="A terms as qe,te,coef triples: --a 0,0,1 1,0,-1 ...")
-    wg.add_argument("--b", nargs="+", default=[],
-                    help="B terms as qe,te,coef triples")
     return parser
 
 
@@ -453,6 +446,89 @@ def webgpu_post_json(
     return result
 
 
+def webgpu_post_canonical(
+    node: Node,
+    path: str,
+    body: bytes,
+    *,
+    timeout: int = 120,
+    headers: dict[str, str] | None = None,
+) -> tuple[dict, bytes]:
+    """POST exact canonical bytes without letting a JSON encoder alter the wire form."""
+    import urllib.error
+    import urllib.request
+
+    if not isinstance(body, bytes):
+        raise ValueError("canonical request body must be bytes")
+    url = _webgpu_url(node, path)
+    request_headers = {"Content-Type": "application/json"}
+    if headers:
+        request_headers.update(headers)
+    request = urllib.request.Request(url, data=body, headers=request_headers, method="POST")
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            raw = response.read()
+            if response.status != 200:
+                raise RuntimeError(f"webgpu POST {url}: HTTP {response.status}")
+    except urllib.error.HTTPError as exc:
+        detail = exc.read(4096).decode("utf-8", "replace")
+        raise RuntimeError(f"webgpu POST {url}: HTTP {exc.code}: {detail}") from exc
+    except OSError as exc:
+        raise RuntimeError(f"webgpu POST {url}: {exc}") from exc
+    try:
+        result = json.loads(raw.decode("ascii"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"webgpu POST {url}: response is not ASCII JSON") from exc
+    if not isinstance(result, dict):
+        raise RuntimeError(f"webgpu POST {url}: response is not a JSON object")
+    return result, raw
+
+
+def webgpu_submit_envelope(
+    node: Node, raw: bytes, timeout: int = 120, *, lease: dict | None = None
+) -> dict:
+    """Submit one validated envelope and require the exact canonical result bytes."""
+    envelope = computation_blob.parse_canonical(raw)
+    headers = None
+    if lease is not None:
+        headers = {
+            "X-Blitter-Lease-Instance": lease["instance_id"],
+            "X-Blitter-Lease-Epoch": str(lease["lease_epoch"]),
+            "X-Blitter-Lease-Token": lease["lease_token"],
+        }
+    result, response_raw = webgpu_post_canonical(
+        node, "/compute-envelope", raw, timeout=timeout, headers=headers
+    )
+    expected = computation_blob.add_mod_result(envelope)
+    if result != expected or response_raw != computation_blob.canonical_bytes(expected):
+        raise RuntimeError("webgpu envelope result is not canonical or does not match the exact result")
+    return result
+
+
+def webgpu_submit_envelope_fenced(
+    node: Node,
+    raw: bytes,
+    *,
+    holder: str,
+    ttl_ms: int,
+    expected_ms: int | None,
+    timeout: int,
+) -> dict:
+    lease = webgpu_acquire_lease(
+        node, holder=holder, ttl_ms=ttl_ms, expected_ms=expected_ms, timeout=timeout
+    )
+    try:
+        result = webgpu_submit_envelope(node, raw, timeout=timeout, lease=lease)
+    except Exception:
+        try:
+            webgpu_release_lease(node, lease, timeout=timeout)
+        except Exception:
+            pass
+        raise
+    webgpu_release_lease(node, lease, timeout=timeout)
+    return result
+
+
 def webgpu_status(node: Node, timeout: int = 120) -> dict:
     """Return validated observational occupancy from daemon or lease gate.
 
@@ -509,16 +585,6 @@ def webgpu_status(node: Node, timeout: int = 120) -> dict:
     return status
 
 
-def webgpu_require_idle(node: Node, timeout: int = 120) -> dict:
-    status = webgpu_status(node, timeout=timeout)
-    if status["busy"] or not status["idle"] or status["active_compute"] or status["queued_compute"]:
-        raise RuntimeError(
-            f"webgpu({node.name}) busy: active={status['active_compute']} "
-            f"queued={status['queued_compute']}"
-        )
-    return status
-
-
 def webgpu_acquire_lease(
     node: Node,
     *,
@@ -568,50 +634,6 @@ def webgpu_release_lease(node: Node, lease: dict, timeout: int = 120) -> dict:
     return result
 
 
-def webgpu_submit(node: Node, job: dict, timeout: int = 120, *, lease: dict | None = None) -> dict:
-    """POST one compute job, optionally under a target-side fencing identity."""
-    headers = None
-    if lease is not None:
-        headers = {
-            "X-Blitter-Lease-Instance": lease["instance_id"],
-            "X-Blitter-Lease-Epoch": str(lease["lease_epoch"]),
-            "X-Blitter-Lease-Token": lease["lease_token"],
-        }
-    result = webgpu_post_json(node, "/compute", job, timeout=timeout, headers=headers)
-    if not isinstance(result.get("ok"), bool):
-        raise RuntimeError("webgpu compute returned invalid response object")
-    return result
-
-
-def webgpu_submit_fenced(
-    node: Node,
-    job: dict,
-    *,
-    holder: str,
-    ttl_ms: int,
-    expected_ms: int | None,
-    timeout: int,
-) -> dict:
-    lease = webgpu_acquire_lease(
-        node, holder=holder, ttl_ms=ttl_ms, expected_ms=expected_ms, timeout=timeout
-    )
-    try:
-        result = webgpu_submit(node, job, timeout=timeout, lease=lease)
-    except Exception:
-        try:
-            webgpu_release_lease(node, lease, timeout=timeout)
-        except Exception:
-            # Preserve the primary compute/fence failure. The target gate itself
-            # remains authoritative and expires/revokes independently.
-            pass
-        raise
-    # A successful result commit is followed by explicit release. Failure to
-    # confirm release makes orchestration fail closed even though the result bytes
-    # may already be mathematically valid.
-    webgpu_release_lease(node, lease, timeout=timeout)
-    return result
-
-
 def cmd_webgpu(nodes: dict[str, Node], args: argparse.Namespace) -> int:
     node = nodes[args.node]
     if args.health and args.status:
@@ -626,71 +648,24 @@ def cmd_webgpu(nodes: dict[str, Node], args: argparse.Namespace) -> int:
         print(json.dumps(webgpu_status(node, timeout=args.timeout), sort_keys=True))
         return 0
 
-    if args.lease_ttl_ms is not None and args.allow_unfenced:
-        raise ValueError("--lease-ttl-ms and --allow-unfenced are mutually exclusive")
     if args.lease_expected_ms is not None and args.lease_ttl_ms is None:
         raise ValueError("--lease-expected-ms requires --lease-ttl-ms")
-    if args.require_idle and not args.allow_unfenced:
-        raise ValueError("--require-idle is only for the explicit --allow-unfenced legacy path")
-    if args.lease_ttl_ms is None and not args.allow_unfenced:
-        raise ValueError(
-            "webgpu compute requires --lease-ttl-ms; use --allow-unfenced only for explicit legacy/testing access"
-        )
+    if args.lease_ttl_ms is None:
+        raise ValueError("webgpu envelope execution requires --lease-ttl-ms")
+    if args.envelope_file is None:
+        raise ValueError("webgpu execution requires --envelope-file")
 
     holder = args.lease_holder or f"cluster-dispatch:{socket.gethostname()}:{os.getpid()}"
-
-    def parse_triples(items: list[str]) -> list[list[int]]:
-        out = []
-        for item in items:
-            parts = [p.strip() for p in item.split(",")]
-            if len(parts) != 3:
-                raise ValueError(f"term must be qe,te,coef: got {item!r}")
-            out.append([int(parts[0]), int(parts[1]), int(parts[2])])
-        return out
-
-    def submit_job(job: dict) -> dict:
-        if args.lease_ttl_ms is not None:
-            return webgpu_submit_fenced(
-                node,
-                job,
-                holder=holder,
-                ttl_ms=args.lease_ttl_ms,
-                expected_ms=args.lease_expected_ms,
-                timeout=args.timeout,
-            )
-        # Explicit legacy/testing escape hatch. Even here we do not submit unless
-        # live observational occupancy says idle; this remains TOCTOU-racy and is
-        # never authority-bearing.
-        webgpu_require_idle(node, timeout=args.timeout)
-        return webgpu_submit(node, job, timeout=args.timeout)
-
-    if args.batch_file:
-        batch = json.loads(args.batch_file.read_text(encoding="utf-8"))
-        jobs = batch.get("jobs", batch if isinstance(batch, list) else [])
-        if not isinstance(jobs, list):
-            raise ValueError("batch jobs must be a list")
-        nok = 0
-        for i, job in enumerate(jobs):
-            try:
-                result = submit_job(job)
-                n = len(result.get("terms", []))
-                print(f"  job[{i}] {n} reduced terms")
-                if not result.get("ok"):
-                    nok += 1
-            except Exception as exc:
-                print(f"  job[{i}] FAILED: {exc}")
-                nok += 1
-        print(f"webgpu({node.name}): {len(jobs) - nok}/{len(jobs)} jobs ok")
-        return 1 if nok else 0
-
-    job = json.loads(args.job_file.read_text(encoding="utf-8")) if args.job_file else {
-        "a": parse_triples(args.a), "b": parse_triples(args.b)
-    }
-    result = submit_job(job)
-    print(f"webgpu({node.name} [{result.get('adapter')}]): {len(result.get('terms', []))} reduced terms")
-    for term in result.get("terms", []):
-        print(f"  (q^q, t^t, coef) = {term}")
-    return 0 if result.get("ok") else 1
+    result = webgpu_submit_envelope_fenced(
+        node,
+        args.envelope_file.read_bytes(),
+        holder=holder,
+        ttl_ms=args.lease_ttl_ms,
+        expected_ms=args.lease_expected_ms,
+        timeout=args.timeout,
+    )
+    print(json.dumps(result, sort_keys=True, separators=(",", ":")))
+    return 0
 
 
 if __name__ == "__main__":

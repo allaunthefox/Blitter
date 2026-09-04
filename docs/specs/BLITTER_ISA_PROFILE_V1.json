@@ -1,0 +1,68 @@
+{
+  "schema": "mathpunch.blitter-isa-profile.v1",
+  "profile_id": "BLITTER-ISA-V1",
+  "semantic_digest": "sha256:cd60e19d6c3652e08d4ed36e3f8208de7f5d2c553cb7e8f5123175c63ff2f129",
+  "status": "PROVISIONAL_PENDING_REVIEW",
+  "provisional_notice": "Generated from the mechanical validator and current executable codec. This profile is not proof of implementation conformance.",
+  "semantic_digest_rule": {
+    "algorithm": "sha256",
+    "meaning": "A digest identifies the targeted semantics; it is not an implementation-conformance proof."
+  },
+  "closed_universe": {
+    "mid_execution_environment_reads": false,
+    "ambient_endianness": false,
+    "ambient_word_size": false,
+    "host_native_layout": false,
+    "clock_required": false,
+    "sensor_required": false
+  },
+  "canonical_types": {
+    "U192FormatByteV1": {
+      "bits": "vv l b rrrr",
+      "admitted_tags": {
+        "0x00": "le-u32-lsw-first",
+        "0x10": "be-u32-lsw-first",
+        "0x20": "le-u32-msw-first",
+        "0x30": "be-u192-msb-first"
+      }
+    }
+  },
+  "opcodes": {
+    "U192_NORMALIZE": {
+      "kind": "representation"
+    },
+    "U192_ADD_MOD": {
+      "kind": "arithmetic",
+      "relation": "value(output) = (value(a) + value(b)) mod 2^192"
+    },
+    "U192_MAX": {
+      "kind": "arithmetic",
+      "comparison_order": "w5,w4,w3,w2,w1,w0 unsigned lexicographic"
+    },
+    "PREFIX_COVER_VALIDATE": {
+      "kind": "coverage-validation"
+    },
+    "GLOBAL_MAX_FROM_COVER": {
+      "kind": "aggregation"
+    }
+  },
+  "separate_protocol_layers": {
+    "lease_and_fencing": "ownership and concurrency control, not arithmetic",
+    "heartbeat": "advisory presence and capacity telemetry, not arithmetic",
+    "ratchet_clock": "provenance timing metadata, not arithmetic",
+    "environmental_jitter": "advisory environmental metadata, not arithmetic",
+    "thermal_ras_ecc": "advisory hardware metadata, not arithmetic",
+    "security_plugin": "optional process-plugin ABI; blocks rather than silently downgrades"
+  },
+  "B4_scope": {
+    "forbidden": [
+      "claim merge.wgsl is an LKB/Burau computation",
+      "claim tailgain.wgsl is an LKB/Burau computation"
+    ]
+  },
+  "conformance": {
+    "not_conformance": [
+      "implementation hash equals profile hash"
+    ]
+  }
+}

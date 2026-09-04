@@ -24,6 +24,14 @@ P2P mesh is not the active deployment model. The current direction is an
 Internet-layer transport carrying artifact-addressed execution requests to
 authenticated beacons, with local capacity gating and independent verification.
 
+## Future Experiment
+
+Evaluate a browser-side replay of the notebook workload in JupyterLite/Pyodide,
+using a pure-Python baseline and treating Numba as optional pending a viable
+WebAssembly/LLVM package. Compare outputs with frozen vectors and record browser,
+package, and device details. This is advisory experimentation only and must not
+enter the current proof or authority path.
+
 ## Layout
 
 ```text

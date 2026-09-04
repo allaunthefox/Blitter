@@ -20,11 +20,11 @@ The operational invariant is:
 | `dispatch.py run` with `auto` / `bare` | **Unsupported** | Use a specialized path or add a tested runtime handler |
 | `GET /health` | Client implemented; daemon deployment-dependent | Liveness only |
 | `GET /status` | Client validation implemented; daemon deployment-dependent | Observational occupancy only |
-| `--require-idle` | Implemented | Fail-closed status precheck; not atomic ownership |
+| Canonical envelope plus target-side lease | Implemented | Fenced WebGPU execution through `/compute-envelope` |
 | Heartbeat v3 | Implemented | Advisory presence/load/hardware/timing |
 | Slot ranking/migration decision | Implemented | Advisory placement policy |
 | `lease_protocol.py` | Implemented | Expected-duration/overrun telemetry only |
-| Target-side atomic lease/fencing | **Required architecture, not implemented by current Python helpers** | Must be implemented/deployed/race-tested before lease-required routing is authoritative |
+| Target-side atomic lease/fencing | Implemented by `experiments/webgpu_blitter/lease_gate.py` | Must be deployed and verified before routing is authoritative |
 
 ## 2. Components
 
@@ -36,7 +36,7 @@ The operational invariant is:
 | `scripts/cluster/lease_protocol.py` | Expected-duration / profound-overrun telemetry; **not lease grant/fencing** |
 | `scripts/cluster/nodes.json` | Static inventory hints only; never proof of live presence |
 | `scripts/cluster/harbor_push.sh` | Build/publish helper; requires explicit operator intent and external credentials |
-| `scripts/cluster/harbor_deploy.sh` | Deployment helper; use only after an explicit rollout decision |
+| `scripts/cluster/harbor_deploy.sh` | Docker-only deployment helper; requires an eligible active bootstrap plan, verified provenance stamp, runtime image-trust policy reference/digest, and published-gate access-control reference/digest before an explicit rollout decision |
 
 Related contracts:
 
@@ -59,7 +59,7 @@ Classify commands before running them:
 | heartbeat `listen` | Opens a UDP listener |
 | heartbeat `announce` | Reads local status and sends UDP heartbeat datagrams |
 | `dispatch.py run` | Starts a real remote container/process through SSH |
-| `dispatch.py webgpu` without `--health/--status` | Submits real `/compute` work |
+| `dispatch.py webgpu` with `--lease-ttl-ms` and `--envelope-file` | Submits real fenced `/compute-envelope` work |
 | `harbor_push.sh` / `harbor_deploy.sh` | Build/publish/deployment operations; may mutate live infrastructure |
 
 Keep SSH keys, registry credentials, API tokens, signing keys, and other secrets outside tracked files and examples.
@@ -97,13 +97,13 @@ Treat these as distinct:
 configured
     -> heartbeat-present
         -> compatible/available
-            -> lease-granted        [required full architecture; not implemented by current helpers]
+            -> lease-granted        [target-side gate]
                 -> executing
 ```
 
 A node can be configured but offline. It can be heartbeat-present but busy. It can appear available but lose a future atomic lease race.
 
-The current `--require-idle` path is an observational guard. Another client can race between `GET /status` and `POST /compute`, so it is not a substitute for target-side atomic ownership/fencing.
+`/status` is observational. Another client can race between `GET /status` and submission, so execution must acquire the target-side atomic lease.
 
 ## 6. Static inventory and direct legacy dispatch
 
@@ -167,22 +167,17 @@ queued_compute
 max_concurrent_compute
 ```
 
-To fail closed on observed occupancy before a current compute request:
+To submit the current canonical envelope:
 
 ```bash
 python3 scripts/cluster/dispatch.py webgpu <node> \
-  --require-idle \
-  --a 1,0,2 0,1,3 \
-  --b 1,0,5 0,0,7
+  --lease-ttl-ms 30000 \
+  --envelope-file request-v2.canonical.json
 ```
 
-This submits real work if the precheck reports idle. The current `/compute` codec uses integer triples:
-
-```text
-[q_exp, t_exp, coefficient]
-```
-
-It is a specific sparse bivariate/Laurent-style multiplication surface, not an arbitrary-WGSL submission endpoint.
+This acquires a target-side lease, submits exactly the canonical v2 U192 envelope,
+and verifies the canonical response. The removed Laurent `/compute` surface is not
+a dispatcher or daemon route.
 
 If `/health` succeeds but `/status` is missing or invalid, treat the daemon as incompatible with occupancy-aware routing rather than inferring idleness.
 
@@ -392,7 +387,9 @@ Before lease-required routing is enabled, the target should demonstrate:
 - concurrent race tests;
 - receipts that bind the actual lease identity.
 
-**Current implementation boundary:** the Python `lease_protocol.py` file does not implement those operations. `/status` plus `--require-idle` remains observational. Treat any lease endpoint as `UNVERIFIED` until the deployed daemon/version and race behavior have been checked.
+`lease_protocol.py` remains telemetry only. `/status` remains observational; the
+WebGPU lease gate implements the authority operations. Treat a remote endpoint as
+unverified until its deployed version and race behavior have been checked.
 
 ## 17. One logical goal across many machines
 
@@ -417,7 +414,7 @@ Every item carries the same `goal_id`. Results, scars, checkpoints, and receipts
 | SSH user unresolved | Set the referenced user-name environment variable; keep credentials outside the repo |
 | `/health` works, `/status` missing | Deployed daemon is not occupancy-status compatible; do not infer idle |
 | `/status` inconsistent | Client fails closed; inspect daemon/version before routing |
-| busy/queued status | Do not submit via `--require-idle`; choose/reassess another slot |
+| busy/queued status | Do not infer execution authority; acquire a target-side lease or choose another slot |
 | heartbeat status read fails | Announcement is unusable capacity by design |
 | stale or expired heartbeat | Historical only; remove from placement |
 | retirement time reached | Historical only; remove from placement |

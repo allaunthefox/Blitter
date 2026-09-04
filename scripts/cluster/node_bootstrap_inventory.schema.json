@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mathpunch.local/schemas/node-bootstrap-inventory-v1.json",
+  "title": "Blitter active node bootstrap inventory",
+  "type": "object",
+  "required": ["schema", "source", "nodes"],
+  "properties": {
+    "schema": {"const": "mathpunch.blitter-node-bootstrap-inventory.v1"},
+    "source": {"const": "scripts/cluster/nodes.json"},
+    "nodes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "address", "ssh", "role", "runtime", "arch", "webgpu_port", "required_runner_capabilities", "required_container_capabilities", "deployment_eligible", "blockers"],
+        "properties": {
+          "name": {"type": "string", "minLength": 1},
+          "address": {"type": "string", "minLength": 1},
+          "ssh": {
+            "type": "object",
+            "required": ["expected_user", "resolved_user"],
+            "properties": {
+              "expected_user": {"type": "string", "description": "Declared dedicated runner identity; empty only when the inventory records a rejection blocker."},
+              "resolved_user": {"type": ["string", "null"]},
+              "user_environment_variable": {"type": "string"}
+            }
+          },
+          "role": {"enum": ["cpu", "gpu", "overflow"]},
+          "runtime": {"type": "string", "minLength": 1},
+          "arch": {"type": "string", "minLength": 1},
+          "webgpu_port": {"type": ["integer", "null"], "minimum": 1, "maximum": 65535},
+          "required_runner_capabilities": {"type": "array", "items": {"type": "string"}},
+          "required_container_capabilities": {"type": "array", "items": {"type": "string"}},
+          "deployment_eligible": {"type": "boolean"},
+          "blockers": {"type": "array", "items": {"type": "string"}}
+        }
+      }
+    }
+  }
+}

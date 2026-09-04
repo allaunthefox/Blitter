@@ -534,15 +534,15 @@ class LeaseGateHandler(BaseHTTPRequestHandler):
                 self._send_json(200, result)
                 return
 
-            if self.path == "/compute":
-                self._compute()
+            if self.path == "/compute-envelope":
+                self._compute(self.path)
                 return
 
             self._send_json(404, {"schema": SCHEMA, "ok": False, "error": "not_found"})
         except LeaseProtocolError as exc:
             self._error(exc)
 
-    def _compute(self):
+    def _compute(self, upstream_path):
         identity = parse_identity(
             self.headers.get(HEADER_INSTANCE),
             self.headers.get(HEADER_EPOCH),
@@ -566,7 +566,7 @@ class LeaseGateHandler(BaseHTTPRequestHandler):
             try:
                 conn.request(
                     "POST",
-                    "/compute",
+                    upstream_path,
                     body=body,
                     headers={"Content-Type": self.headers.get("Content-Type", "application/json")},
                 )

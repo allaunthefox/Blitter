@@ -41,6 +41,15 @@ class BlitterClaimGateTests(unittest.TestCase):
             registry = root / "registry.md"
             receipts = root / "receipts"
             receipts.mkdir()
+            (receipts / "BLITTER-10.json").write_text(json.dumps({
+                "schema": "mathpunch.blitter-claim-evidence.v1",
+                "claim_id": "BLITTER-10",
+                "status": "PASS",
+                "source_commit": "a" * 40,
+                "evidence_hashes": {"proof": "sha256:" + "0" * 64},
+                "falsifiers": ["negative-control:PASS"],
+                "independence_tier": "I2",
+            }))
             for removed in (
                 "no host-native, auto-detection, or generic mixed mode",
                 "`BLITTER-ISA-V1` is the single semantic source",
@@ -49,7 +58,7 @@ class BlitterClaimGateTests(unittest.TestCase):
                 "lease/fencing has separate safety/liveness obligations",
             ):
                 with self.subTest(removed=removed):
-                    registry.write_text(BASE_ROWS.replace(removed, "REMOVED", 1))
+                    registry.write_text(BASE_ROWS.replace(removed, "REMOVED"))
                     with self.assertRaisesRegex(GateError, "contract phrase missing"):
                         validate_registry(registry, receipts)
 

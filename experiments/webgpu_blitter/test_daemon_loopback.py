@@ -8,7 +8,6 @@ adapter (Mesa llvmpipe/lavapipe where available), and supplies BLITTER_DAEMON_BI
 
 from __future__ import annotations
 
-import concurrent.futures
 import http.client
 import json
 import os
@@ -93,6 +92,11 @@ class DaemonProcess:
 
 
 class BlitterDaemonLoopbackTests(unittest.TestCase):
+    PROFILE_ID = "BLITTER-ISA-V1"
+    PROFILE_DIGEST = "sha256:cd60e19d6c3652e08d4ed36e3f8208de7f5d2c553cb7e8f5123175c63ff2f129"
+    TERMINAL_DIGEST = "sha256:5a9804978698791d50d937ba93b7f279344b2e0ea658f4e2ee7b2d5a3365fb7f"
+    ASSEMBLER_DIGEST = "sha256:" + "c" * 64
+
     @classmethod
     def setUpClass(cls):
         raw = os.environ.get("BLITTER_DAEMON_BIN")
@@ -102,7 +106,15 @@ class BlitterDaemonLoopbackTests(unittest.TestCase):
         if not binary.is_absolute() or not binary.is_file():
             raise RuntimeError("BLITTER_DAEMON_BIN must be an existing absolute path")
         cls.daemon = DaemonProcess(binary)
-        cls.daemon.start()
+        cls.daemon.start(extra_env={
+            "BLITTER_ENVELOPE_PROFILE_ID": cls.PROFILE_ID,
+            "BLITTER_ENVELOPE_PROFILE_DIGEST": cls.PROFILE_DIGEST,
+            "BLITTER_ENVELOPE_TERMINAL_CONTRACT_DIGEST": cls.TERMINAL_DIGEST,
+            "BLITTER_ENVELOPE_ASSEMBLER_MODULE_DIGEST": cls.ASSEMBLER_DIGEST,
+            "BLITTER_ENVELOPE_MAX_CPUS": "2",
+            "BLITTER_ENVELOPE_MAX_MEMORY_MIB": "128",
+            "BLITTER_ENVELOPE_MAX_WALL_MS": "1000",
+        })
 
     @classmethod
     def tearDownClass(cls):
@@ -125,7 +137,7 @@ class BlitterDaemonLoopbackTests(unittest.TestCase):
 
     def test_malformed_request_fails_and_is_counted(self):
         _, before = self.daemon.request("GET", "/status")
-        status, result = self.daemon.request("POST", "/compute", raw_body='{"a":[]}')
+        status, result = self.daemon.request("POST", "/compute-envelope", raw_body='{"a":[]}')
         self.assertEqual(status, 400)
         self.assertIs(result.get("ok"), False)
         _, after = self.daemon.request("GET", "/status")
@@ -134,48 +146,56 @@ class BlitterDaemonLoopbackTests(unittest.TestCase):
         self.assertEqual(after["active_compute"], 0)
         self.assertEqual(after["queued_compute"], 0)
 
-    def test_exact_compute_matches_independent_expected_value(self):
-        job = {
-            "a": [[1, 0, 2], [0, 1, 3]],
-            "b": [[1, 0, 5], [0, 0, 7]],
-        }
-        status, result = self.daemon.request("POST", "/compute", payload=job, timeout=30)
-        self.assertEqual(status, 200)
-        self.assertIs(result.get("ok"), True)
-        self.assertEqual(
-            result.get("terms"),
-            [[0, 1, 21], [1, 0, 14], [1, 1, 15], [2, 0, 10]],
-        )
-
-    def test_exact_domain_overflow_returns_failure_without_stuck_occupancy(self):
-        job = {"a": [[0, 0, 2147483647]], "b": [[0, 0, 2]]}
-        status, result = self.daemon.request("POST", "/compute", payload=job, timeout=30)
-        self.assertEqual(status, 500)
+    def test_legacy_compute_route_is_not_exposed(self):
+        status, result = self.daemon.request("POST", "/compute", raw_body="{}")
+        self.assertEqual(status, 404)
         self.assertIs(result.get("ok"), False)
-        self.assertIn("exact i32 GPU domain", result.get("error", ""))
-        _, state = self.daemon.request("GET", "/status")
-        self.assertEqual(state["active_compute"], 0)
-        self.assertEqual(state["queued_compute"], 0)
-        self.assertIs(state["idle"], True)
 
-    def test_concurrent_clients_are_serialized_and_all_results_are_exact(self):
-        job = {
-            "a": [[0, 0, 1], [1, 0, 1], [2, 0, 1], [3, 0, 1]],
-            "b": [[0, 1, 2], [1, 1, -1], [2, 1, 3], [3, 1, 1]],
+    def envelope(self, left_hex, right_hex):
+        return {
+            "schema": "mathpunch.blitter-computation-envelope.v2",
+            "request_id": "loopback-1",
+            "operation": "u192.add-mod",
+            "profile_digest": self.PROFILE_DIGEST,
+            "profile_id": self.PROFILE_ID,
+            "codec": "mathpunch.u192-abi.v1",
+            "inputs": [
+                {"schema": "mathpunch.u192-abi.v1", "format_tag": 0,
+                 "payload_hex": left_hex},
+                {"schema": "mathpunch.u192-abi.v1", "format_tag": 0,
+                 "payload_hex": right_hex},
+            ],
+            "resource_budget": {"cpus": 1, "memory_mib": 64, "wall_ms": 1000},
+            "terminal_contract_digest": self.TERMINAL_DIGEST,
+            "assembler": {"module_digest": self.ASSEMBLER_DIGEST,
+                          "interface": "wasi-preview2-component-v1"},
+            "authority": "none",
         }
 
-        def submit(_):
-            return self.daemon.request("POST", "/compute", payload=job, timeout=60)
+    def test_compute_envelope_is_distinct_canonical_u192_addition(self):
+        envelope = self.envelope("ff" * 24, "01" + "00" * 23)
+        raw = (json.dumps(envelope, sort_keys=True, separators=(",", ":")) + "\n").encode("ascii")
+        status, result = self.daemon.request(
+            "POST", "/compute-envelope", raw_body=raw, timeout=30
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(result, {
+            "authority": "none",
+            "codec": "mathpunch.u192-canonical.v1",
+            "request_digest": "sha256:" + __import__("hashlib").sha256(raw).hexdigest(),
+            "schema": "mathpunch.blitter-computation-result.v1",
+            "words": [0] * 6,
+        })
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
-            responses = list(pool.map(submit, range(16)))
-        self.assertTrue(all(status == 200 and body.get("ok") is True for status, body in responses))
-        first_terms = responses[0][1]["terms"]
-        self.assertTrue(all(body["terms"] == first_terms for _, body in responses))
-        _, state = self.daemon.request("GET", "/status")
-        self.assertEqual(state["active_compute"], 0)
-        self.assertEqual(state["queued_compute"], 0)
-        self.assertIs(state["idle"], True)
+        status, rejected = self.daemon.request(
+            "POST", "/compute-envelope", raw_body=raw.rstrip(b"\n"), timeout=30
+        )
+        self.assertEqual(status, 400)
+        self.assertIs(rejected.get("ok"), False)
+
+        status, legacy = self.daemon.request("POST", "/compute", raw_body=raw, timeout=30)
+        self.assertEqual(status, 404)
+        self.assertIs(legacy.get("ok"), False)
 
     def test_unknown_route_is_explicit_404(self):
         status, result = self.daemon.request("GET", "/not-a-route")

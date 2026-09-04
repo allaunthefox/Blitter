@@ -4,7 +4,7 @@
     {
       "name": "cupfox",
       "address": "100.115.119.40",
-      "ssh_user": "root",
+      "runner_user": "forgejo-runner",
       "role": "cpu",
       "runtime": "docker",
       "max_cpus": 2,
@@ -16,7 +16,7 @@
     {
       "name": "nixos-laptop",
       "address": "100.102.173.61",
-      "ssh_user": "root",
+      "runner_user": "forgejo-runner",
       "role": "cpu",
       "runtime": "nix-podman",
       "max_cpus": 8,
@@ -28,7 +28,7 @@
     {
       "name": "qfox-1",
       "address": "100.88.57.96",
-      "ssh_user": "allaun",
+      "runner_user": "forgejo-runner",
       "role": "gpu",
       "runtime": "podman-nvidia-cdi",
       "max_cpus": 8,
@@ -40,7 +40,7 @@
     {
       "name": "neon-rs1000",
       "address": "100.79.14.103",
-      "ssh_user": "${MATHPUNCH_NEON_USER}",
+      "runner_user": "${MATHPUNCH_NEON_USER}",
       "role": "overflow",
       "runtime": "auto",
       "max_cpus": 8,
@@ -53,7 +53,7 @@
     {
       "name": "nasfox",
       "address": "100.119.121.83",
-      "ssh_user": "root",
+      "runner_user": "forgejo-runner",
       "role": "gpu",
       "runtime": "bare",
       "max_cpus": 8,

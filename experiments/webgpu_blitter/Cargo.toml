@@ -2,8 +2,39 @@
 name = "webgpu-blitter"
 version = "0.1.0"
 edition = "2021"
+autobins = false
+
+[features]
+research-tools = []
+
+[[bin]]
+name = "blitter-daemon"
+path = "src/bin/blitter-daemon.rs"
+
+[[bin]]
+name = "blitter-ternary-scalar"
+path = "src/bin/blitter-ternary-scalar.rs"
+
+[[bin]]
+name = "webgpu-blitter"
+path = "src/main.rs"
+required-features = ["research-tools"]
+
+[[bin]]
+name = "merge"
+path = "src/bin/merge.rs"
+required-features = ["research-tools"]
+
+[[bin]]
+name = "tailgain"
+path = "src/bin/tailgain.rs"
+required-features = ["research-tools"]
 
 [dependencies]
 wgpu = "30"
 pollster = "0.4"
 bytemuck = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+num-bigint = "0.4"

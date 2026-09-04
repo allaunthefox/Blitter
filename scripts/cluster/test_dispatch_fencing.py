@@ -2,221 +2,116 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import io
+import json
 import unittest
 from contextlib import redirect_stdout
-from unittest.mock import call, patch
+from unittest.mock import Mock, patch
 
+import computation_blob
 import dispatch
 
 
 NODE = dispatch.Node(
-    name="test-node",
-    address="127.0.0.1",
-    ssh_user="root",
-    role="gpu",
-    runtime="docker",
-    max_cpus=4,
-    max_memory_gib=8,
-    ephemeral=False,
-    webgpu_port=8790,
+    name="test-node", address="127.0.0.1", ssh_user="root", role="gpu",
+    runtime="docker", max_cpus=4, max_memory_gib=8, ephemeral=False, webgpu_port=8790,
 )
 
 
 def args(**overrides):
-    base = dict(
-        node=NODE.name,
-        health=False,
-        status=False,
-        require_idle=False,
-        lease_ttl_ms=None,
-        lease_expected_ms=None,
-        lease_holder=None,
-        allow_unfenced=False,
-        job_file=None,
-        batch_file=None,
-        timeout=120,
-        a=["0,0,1"],
-        b=["0,0,1"],
+    value = dict(
+        node=NODE.name, health=False, status=False, lease_ttl_ms=None,
+        lease_expected_ms=None, lease_holder=None, envelope_file=None, timeout=120,
     )
-    base.update(overrides)
-    return argparse.Namespace(**base)
+    value.update(overrides)
+    return argparse.Namespace(**value)
+
+
+def envelope():
+    return {
+        "schema": computation_blob.SCHEMA,
+        "request_id": "dispatch-1",
+        "operation": computation_blob.OPERATION,
+        "profile_id": computation_blob.semantic_profile_registry.U192_ADD_MOD_PROFILE_ID,
+        "profile_digest": computation_blob.semantic_profile_registry.U192_ADD_MOD_PROFILE_DIGEST,
+        "codec": computation_blob.CODEC,
+        "inputs": [
+            {"schema": computation_blob.CODEC, "format_tag": 0,
+             "payload_hex": "01000000" + "00" * 20},
+            {"schema": computation_blob.CODEC, "format_tag": 0,
+             "payload_hex": "02000000" + "00" * 20},
+        ],
+        "resource_budget": {"cpus": 1, "memory_mib": 64, "wall_ms": 1000},
+        "terminal_contract_digest": computation_blob.registered_terminal_contract_digest(
+            computation_blob.semantic_profile_registry.resolve_profile(
+                computation_blob.semantic_profile_registry.U192_ADD_MOD_PROFILE_ID,
+                computation_blob.semantic_profile_registry.U192_ADD_MOD_PROFILE_DIGEST,
+            )
+        ),
+        "assembler": {"module_digest": "sha256:" + "a" * 64, "interface": "wasi-preview2-component-v1"},
+        "authority": "none",
+    }
 
 
 class DispatchFencingTests(unittest.TestCase):
-    def test_default_compute_refuses_without_authoritative_lease(self):
+    def test_execution_requires_fenced_canonical_envelope(self):
         with self.assertRaisesRegex(ValueError, "requires --lease-ttl-ms"):
             dispatch.cmd_webgpu({NODE.name: NODE}, args())
+        with self.assertRaisesRegex(ValueError, "requires --envelope-file"):
+            dispatch.cmd_webgpu({NODE.name: NODE}, args(lease_ttl_ms=1000))
 
-    def test_unfenced_escape_hatch_always_preflights_idle_before_submit(self):
-        events = []
-
-        def idle(node, timeout=120):
-            events.append("idle")
-            return {"ok": True, "idle": True, "busy": False,
-                    "active_compute": 0, "queued_compute": 0}
-
-        def submit(node, job, timeout=120, *, lease=None):
-            events.append("submit")
-            self.assertIsNone(lease)
-            return {"ok": True, "adapter": "test", "terms": [[0, 0, 1]]}
-
-        with patch.object(dispatch, "webgpu_require_idle", side_effect=idle), \
-             patch.object(dispatch, "webgpu_submit", side_effect=submit), \
-             redirect_stdout(io.StringIO()):
-            rc = dispatch.cmd_webgpu(
-                {NODE.name: NODE}, args(allow_unfenced=True)
-            )
-        self.assertEqual(rc, 0)
-        self.assertEqual(events, ["idle", "submit"])
-
-    def test_unfenced_busy_preflight_prevents_submit(self):
+    def test_envelope_client_transmits_raw_bytes_and_checks_exact_result(self):
+        raw = computation_blob.canonical_bytes(envelope())
+        expected = computation_blob.add_mod_result(envelope())
+        response_raw = computation_blob.canonical_bytes(expected)
+        lease = {"instance_id": "gate", "lease_epoch": 4, "lease_token": "x" * 64}
         with patch.object(
-            dispatch,
-            "webgpu_require_idle",
-            side_effect=RuntimeError("busy"),
-        ), patch.object(dispatch, "webgpu_submit") as submit:
-            with self.assertRaisesRegex(RuntimeError, "busy"):
-                dispatch.cmd_webgpu(
-                    {NODE.name: NODE}, args(allow_unfenced=True)
-                )
-        submit.assert_not_called()
-
-    def test_fenced_helper_orders_acquire_compute_release(self):
-        events = []
-        lease = {
-            "ok": True,
-            "instance_id": "gate-instance",
-            "lease_epoch": 9,
-            "lease_token": "a" * 64,
-        }
-
-        def acquire(node, *, holder, ttl_ms, expected_ms=None, timeout=120):
-            events.append(("acquire", holder, ttl_ms, expected_ms, timeout))
-            return lease
-
-        def submit(node, job, timeout=120, *, lease=None):
-            events.append(("compute", lease, timeout))
-            return {"ok": True, "terms": [[0, 0, 1]]}
-
-        def release(node, received, timeout=120):
-            events.append(("release", received, timeout))
-            return {"ok": True, "released": True}
-
-        with patch.object(dispatch, "webgpu_acquire_lease", side_effect=acquire), \
-             patch.object(dispatch, "webgpu_submit", side_effect=submit), \
-             patch.object(dispatch, "webgpu_release_lease", side_effect=release):
-            result = dispatch.webgpu_submit_fenced(
-                NODE,
-                {"a": [[0, 0, 1]], "b": [[0, 0, 1]]},
-                holder="worker-a",
-                ttl_ms=30000,
-                expected_ms=12000,
-                timeout=77,
-            )
-
-        self.assertTrue(result["ok"])
-        self.assertEqual(
-            events,
-            [
-                ("acquire", "worker-a", 30000, 12000, 77),
-                ("compute", lease, 77),
-                ("release", lease, 77),
-            ],
+            dispatch, "webgpu_post_canonical", return_value=(expected, response_raw)
+        ) as post:
+            self.assertEqual(dispatch.webgpu_submit_envelope(NODE, raw, timeout=9, lease=lease), expected)
+        post.assert_called_once_with(
+            NODE, "/compute-envelope", raw, timeout=9,
+            headers={
+                "X-Blitter-Lease-Instance": "gate",
+                "X-Blitter-Lease-Epoch": "4",
+                "X-Blitter-Lease-Token": "x" * 64,
+            },
         )
 
-    def test_acquire_failure_prevents_compute_and_release(self):
-        with patch.object(
-            dispatch,
-            "webgpu_acquire_lease",
-            side_effect=RuntimeError("lease held"),
-        ), patch.object(dispatch, "webgpu_submit") as submit, \
-             patch.object(dispatch, "webgpu_release_lease") as release:
-            with self.assertRaisesRegex(RuntimeError, "lease held"):
-                dispatch.webgpu_submit_fenced(
-                    NODE, {"a": [], "b": []},
-                    holder="worker", ttl_ms=1000,
-                    expected_ms=None, timeout=10,
-                )
-        submit.assert_not_called()
-        release.assert_not_called()
+    def test_noncanonical_request_never_reaches_transport(self):
+        with patch.object(dispatch, "webgpu_post_canonical") as post:
+            with self.assertRaisesRegex(ValueError, "invalid computation envelope|canonical"):
+                dispatch.webgpu_submit_envelope(NODE, b'{"schema":"wrong"}\n', lease={})
+        post.assert_not_called()
 
-    def test_compute_failure_attempts_release_but_preserves_primary_error(self):
-        lease = {
-            "ok": True,
-            "instance_id": "gate-instance",
-            "lease_epoch": 3,
-            "lease_token": "b" * 64,
-        }
-        with patch.object(dispatch, "webgpu_acquire_lease", return_value=lease), \
-             patch.object(
-                 dispatch, "webgpu_submit",
-                 side_effect=RuntimeError("fenced_at_commit"),
-             ), \
-             patch.object(
-                 dispatch, "webgpu_release_lease",
-                 side_effect=RuntimeError("release also failed"),
-             ) as release:
-            with self.assertRaisesRegex(RuntimeError, "fenced_at_commit"):
-                dispatch.webgpu_submit_fenced(
-                    NODE, {"a": [], "b": []},
-                    holder="worker", ttl_ms=1000,
-                    expected_ms=None, timeout=10,
-                )
-        release.assert_called_once_with(NODE, lease, timeout=10)
+    def test_fenced_envelope_orders_acquire_compute_release(self):
+        lease = {"ok": True, "instance_id": "gate", "lease_epoch": 9, "lease_token": "x" * 64}
+        raw = computation_blob.canonical_bytes(envelope())
+        expected = computation_blob.add_mod_result(envelope())
+        events = []
+        with patch.object(dispatch, "webgpu_acquire_lease", side_effect=lambda *a, **k: events.append("acquire") or lease), \
+             patch.object(dispatch, "webgpu_submit_envelope", side_effect=lambda *a, **k: events.append("compute") or expected), \
+             patch.object(dispatch, "webgpu_release_lease", side_effect=lambda *a, **k: events.append("release") or {"ok": True, "released": True}):
+            self.assertEqual(
+                dispatch.webgpu_submit_envelope_fenced(
+                    NODE, raw, holder="worker", ttl_ms=1000, expected_ms=None, timeout=10
+                ),
+                expected,
+            )
+        self.assertEqual(events, ["acquire", "compute", "release"])
 
-    def test_release_failure_after_success_fails_orchestration_closed(self):
-        lease = {
-            "ok": True,
-            "instance_id": "gate-instance",
-            "lease_epoch": 4,
-            "lease_token": "c" * 64,
-        }
-        with patch.object(dispatch, "webgpu_acquire_lease", return_value=lease), \
-             patch.object(
-                 dispatch, "webgpu_submit",
-                 return_value={"ok": True, "terms": []},
-             ), \
-             patch.object(
-                 dispatch, "webgpu_release_lease",
-                 side_effect=RuntimeError("release not confirmed"),
-             ):
-            with self.assertRaisesRegex(RuntimeError, "release not confirmed"):
-                dispatch.webgpu_submit_fenced(
-                    NODE, {"a": [], "b": []},
-                    holder="worker", ttl_ms=1000,
-                    expected_ms=None, timeout=10,
-                )
-
-    def test_lease_gate_status_counts_active_reservation_as_busy(self):
-        raw = {
-            "schema": dispatch.LEASE_STATUS_SCHEMA,
-            "ok": True,
-            "instance_id": "gate-instance",
-            "lease_epoch": 7,
-            "lease_active": True,
-            "lease_expired": False,
-            "lease_holder": "worker",
-            "lease_remaining_ms": 500,
-            "in_flight": False,
-        }
-        with patch.object(dispatch, "webgpu_get_json", return_value=raw):
-            normalized = dispatch.webgpu_status(NODE)
-        self.assertTrue(normalized["busy"])
-        self.assertFalse(normalized["idle"])
-        self.assertEqual(normalized["active_compute"], 0)
-        self.assertIs(normalized["lease_gate"], raw)
-
-    def test_cli_contract_rejects_conflicting_or_incomplete_modes(self):
-        bad = [
-            (args(lease_ttl_ms=1000, allow_unfenced=True), "mutually exclusive"),
-            (args(lease_expected_ms=10), "requires --lease-ttl-ms"),
-            (args(require_idle=True, lease_ttl_ms=1000), "only for"),
-        ]
-        for namespace, message in bad:
-            with self.subTest(message=message):
-                with self.assertRaisesRegex(ValueError, message):
-                    dispatch.cmd_webgpu({NODE.name: NODE}, namespace)
+    def test_cli_prints_only_canonical_result(self):
+        raw = computation_blob.canonical_bytes(envelope())
+        expected = computation_blob.add_mod_result(envelope())
+        with patch.object(dispatch, "webgpu_submit_envelope_fenced", return_value=expected), \
+             redirect_stdout(io.StringIO()) as output:
+            path = Mock()
+            path.read_bytes.return_value = raw
+            self.assertEqual(
+                dispatch.cmd_webgpu({NODE.name: NODE}, args(lease_ttl_ms=1000, envelope_file=path)), 0
+            )
+        self.assertEqual(json.loads(output.getvalue()), expected)
 
 
 if __name__ == "__main__":

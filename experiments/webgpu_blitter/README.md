@@ -4,6 +4,22 @@
 **Branch context:** `research/interval-certificate-probes`; the kernels
 below are exact-integer and fabric-verified byte-identical.
 
+## Target Boundary
+
+`blitter-daemon` and `blitter-ternary-scalar` are the only standard Cargo
+targets. The Laurent pipeline, `merge`, and `tailgain` are research tools and
+require explicit opt-in:
+
+```bash
+cargo build --locked --features research-tools --bin merge
+cargo build --locked --features research-tools --bin tailgain
+```
+
+Research tools are excluded from deployment images and must not be exposed as
+daemon routes. Promotion requires a versioned semantic profile, canonical
+request/result ABI, frozen conformance corpus, independent verifier, and
+target-route tests.
+
 ## The idea
 
 WebGPU is the universal instruction set. Any node with a WebGPU device —
@@ -42,7 +58,7 @@ internal triples validated in-shader; carry-chain word addition.
 
 Run:
 
-    cargo build --release --bin tailgain
+    cargo build --release --features research-tools --bin tailgain
     ./target/release/tailgain --jobs jobs.json      # BLITTER_ADAPTER=<name> selects the device
 
 ### `src/merge.wgsl` + `src/bin/merge.rs` — sharded exact merge
@@ -96,9 +112,9 @@ identified correctly on every device family.
 
 ## Deployment notes
 
-- The nodes run the `webgpu-blitter` daemon on port 8790 (`/compute`,
-  Laurent jobs). The kernels above are standalone binaries for the same
-  fabric.
+- The nodes run the `blitter-daemon` on port 8790 for canonical
+  `/compute-envelope` requests. The kernels above are standalone research
+  binaries and are not daemon routes.
 - **musl builds cannot dlopen glibc's libvulkan** — use the glibc build;
   on CPU nodes run it inside the `blitter-daemon` container (the host
   context lacks the Vulkan ICD environment).

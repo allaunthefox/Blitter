@@ -24,12 +24,12 @@ A machine may remain in configuration, receipts, provenance, or an LLM-visible l
 | --- | --- | --- |
 | Static inventory | Implemented | Configuration/history only |
 | WebGPU `/health` client | Implemented; deployed endpoint must be verified | Liveness only |
-| WebGPU `/status` validation / `--require-idle` | Implemented in client; deployment-dependent | Observational occupancy only |
+| WebGPU `/status` validation | Implemented in client; deployment-dependent | Observational occupancy only |
 | Heartbeat wire v3 | Implemented in `blitter_heartbeat.py` | Advisory presence/load/timing |
 | Heartbeat-to-slot conversion and ranking | Implemented in `slot_scheduler.py` | Advisory placement only |
 | Migration decision policy | Implemented in `slot_scheduler.py` | Advisory transition proposal |
 | Expected occupancy / overrun telemetry | Implemented in `lease_protocol.py` | Scheduling telemetry only; **not lease fencing** |
-| Target-side atomic lease/fencing | **Required design; not implemented by the current Python helpers** | Future execution ownership/fencing |
+| Target-side atomic lease/fencing | Implemented by the WebGPU lease gate; deployment topology remains operator-owned | Execution ownership/fencing |
 | Mathematical result promotion | Existing MathPunch authority path | Outside scheduler authority |
 
 The current Python helper named `lease_protocol.py` models expected-duration/overrun telemetry. It does **not** grant lease tokens, fencing epochs, or authoritative TTLs.

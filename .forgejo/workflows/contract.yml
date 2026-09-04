@@ -29,6 +29,21 @@ jobs:
           set -eu
           python3 scripts/cluster/test_workspace_execution.py
           python3 scripts/cluster/test_mathpunch_binding.py
+      - name: Run canonical envelope, dispatch, and runner boundary tests
+        run: |
+          set -eu
+          python3 scripts/ci/test_deployable_target_boundary.py
+          python3 scripts/cluster/test_semantic_profile_registry.py
+          python3 scripts/cluster/test_computation_blob.py
+          python3 scripts/cluster/test_mcp_blob_assembler.py
+          python3 scripts/cluster/test_dispatch_fencing.py
+          python3 scripts/cluster/test_node_bootstrap_inventory.py
+          python3 scripts/cluster/test_node_bootstrap_plan.py
+          python3 scripts/cluster/test_mechanics_runner_contract.py
+          python3 scripts/cluster/test_durable_lease_v2.py
+          python3 scripts/cluster/test_harbor_deploy_contract.py
+          python3 experiments/webgpu_blitter/test_lease_gate.py
+          python3 experiments/webgpu_blitter/test_stack_topology.py
 
   lease-service:
     name: Target-side LSP lease service

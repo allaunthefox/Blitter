@@ -1,0 +1,20 @@
+{
+  "schema": "blitter-ternary-scalar-conformance-lock-v1",
+  "profile_id": "blitter-ternary-step-i32-v1",
+  "authority": {
+    "checkout": "/tmp/opencode/mathpunch-blitter-verify-d5a7de60",
+    "git_base_commit": "847db3b19fc7dae499f623fb49d740c843e592ec",
+    "exporter": "experiments/blitter_surface_program/representation_challenge_v1.py",
+    "exporter_source_state": "staged addition atop git_base_commit; content pinned by exporter_sha256",
+    "exporter_sha256": "4adf700be1730e631ecc51a4fcb10dc398ae84541a08f05b34afa8ef076031f6",
+    "profile": "experiments/blitter_ternary_profile/ternary_step_profile_v1.py",
+    "profile_sha256": "72fbadccaef69637c5a212876c97140d4751d86eca881f854814fc61b054545c"
+  },
+  "request_fixture": "ternary_scalar_requests_v1.bin",
+  "request_records": 3072,
+  "request_bytes": 79872,
+  "request_sha256": "49056e9d1de8a6697eca9329d3b74127b63257b75fdb38345bf86996009711c8",
+  "result_records": 3072,
+  "result_bytes": 79872,
+  "result_sha256": "f0fd3b364ef7ee378106187d62898e110f109d9f69ed9dcff30f303725cea800"
+}

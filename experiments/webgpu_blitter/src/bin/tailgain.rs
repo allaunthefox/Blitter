@@ -32,7 +32,6 @@ struct Job {
     pairs: [u32; 256],
 }
 
-const WORDS: usize = 6;
 const OUT_STRIDE: usize = 7;
 
 fn lcm_words(n: u32) -> [u32; 6] {
@@ -84,7 +83,7 @@ fn div_word(l: &mut [u32; 6], d: u32) {
     }
 }
 
-fn weight_words(n2: u32, e: u32, l: &[u32; 6]) -> [u32; 6] {
+fn weight_words(e: u32, l: &[u32; 6]) -> [u32; 6] {
     let mut w = *l;
     div_word(&mut w, e);
     w
@@ -130,7 +129,7 @@ fn main() {
 
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("tailgain"),
-        source: wgpu::ShaderSource::Wgsl(include_str!("tailgain.wgsl").into()),
+        source: wgpu::ShaderSource::Wgsl(include_str!("../tailgain.wgsl").into()),
     });
     let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("bgl"),
@@ -238,7 +237,7 @@ fn main() {
             },
         };
         let weights: Vec<u32> = (65..=n2)
-            .flat_map(|e| weight_words(n2, e, &l).into_iter())
+            .flat_map(|e| weight_words(e, &l).into_iter())
             .collect();
         let n_cand: u32 = 1u32 << d;
 
@@ -340,4 +339,3 @@ fn gcd_big(a: &num_bigint::BigUint, b: &num_bigint::BigUint) -> num_bigint::BigU
     }
     a
 }
-
